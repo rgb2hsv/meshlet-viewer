@@ -3,3 +3,6 @@
 /.cache/
 compile_commands.json
 imgui.ini
+
+# large scan, kept locally only (see README)
+/assets/lucy.ply

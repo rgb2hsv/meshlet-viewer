@@ -18,7 +18,6 @@ The UI is Dear ImGui on GLFW.
 
 ```bash
 git submodule update --init --recursive
-git lfs pull   # assets/lucy.ply (533 MB) is stored with Git LFS
 ```
 
 Everything except the Vulkan driver is built from `external/`. The Vulkan SDK is not
@@ -35,7 +34,7 @@ cmake --build build
 ## Run
 
 ```bash
-./build/meshlets                       # loads assets/lucy.ply (Z-up)
+./build/meshlets                       # loads assets/lucy.ply if present (Z-up)
 ./build/meshlets path/to/model.ply     # or -i/--input PATH
 ./build/meshlets -a flex --max-vertices 128 --max-triangles 128 --min-triangles 64
 ./build/meshlets -c shaded --matcap metal_carpaint --wireframe --wire-width 0.05
@@ -65,5 +64,7 @@ after every build.
 `assets/matcap/license.txt`). They were converted from Blender's EXRs as
 diffuse + specular (the look of a white material), clipped to [0, 1] and stored as 8-bit sRGB.
 
-`assets/lucy.ply` is the Stanford Lucy scan from the Stanford 3D Scanning Repository.
+The default model, `assets/lucy.ply`, is not in the repository (533 MB). It is the Stanford
+Lucy scan from the Stanford 3D Scanning Repository (http://graphics.stanford.edu/data/3Dscanrep/);
+download it and place it at `assets/lucy.ply`, or pass any other model on the command line.
 Its terms allow research use and ask for attribution.
