@@ -52,7 +52,8 @@ cmake --build build
 ```
 
 Mouse: left-drag to orbit, Shift+left-drag or middle-drag to pan, right-drag or the
-wheel to zoom. You can also drop a `.ply`/`.obj` file onto the window to load it.
+wheel to zoom. "Auto-rotate" (or `--auto-rotate`, `--rotate-speed DEG`) turns the object about
+the screen's vertical axis through its center. You can also drop a `.ply`/`.obj` file onto the window to load it.
 
 Batch use: `--frames N --screenshot out.ppm` renders N frames after loading,
 saves the last frame and exits. A one-line meshlet summary is printed to stdout

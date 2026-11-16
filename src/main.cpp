@@ -181,6 +181,18 @@ struct App
     static constexpr float kSidebarMinWidth = 300.f;
     float sidebarWidth = kSidebarDefaultWidth; // logical pixels; the 3D view renders to its right
 
+    // object rotation (auto-rotate turns the model about the screen's vertical axis through its center)
+    bool autoRotate = false;
+    float rotateSpeed = 30.f; // degrees per second
+    Eigen::Quaternionf objectRotation = Eigen::Quaternionf::Identity();
+    Eigen::Vector3f rotationCenter = Eigen::Vector3f::Zero();
+
+    void resetRotation(const Model& m)
+    {
+        objectRotation = Eigen::Quaternionf::Identity();
+        rotationCenter = Eigen::Vector3f(m.boundsMin[0] + m.boundsMax[0], m.boundsMin[1] + m.boundsMax[1], m.boundsMin[2] + m.boundsMax[2]) * 0.5f;
+    }
+
     bool freezeLod = false; // LOD selection + culling use a snapshot of the camera
     Eigen::Matrix4f frozenViewProj = Eigen::Matrix4f::Identity();
     Eigen::Vector3f frozenEye = Eigen::Vector3f::Zero();
@@ -254,6 +266,7 @@ struct App
                 model = result.model;
                 camera.frame(*model);
                 camera.distance /= initialZoom;
+                resetRotation(*model);
                 draw.wireWidth = firstLoad && wireWidthOverride > 0.f ? wireWidthOverride : model->avgEdgeLength * kAutoWireFraction;
                 draw.outlineWidth =
                     firstLoad && outlineWidthOverride > 0.f ? outlineWidthOverride : model->avgEdgeLength * kAutoOutlineFraction;
@@ -363,7 +376,19 @@ void App::ui()
                 camera.frame(*model);
             ImGui::SameLine();
             if (ImGui::Button("Reset camera"))
+            {
                 camera.frame(*model);
+                resetRotation(*model);
+            }
+
+            ImGui::Checkbox("Auto-rotate", &autoRotate);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Turn the object about the screen's vertical axis through its center");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!autoRotate);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::SliderFloat("##rotatespeed", &rotateSpeed, -180.f, 180.f, "%.0f deg/s");
+            ImGui::EndDisabled();
         }
     }
 
@@ -765,6 +790,8 @@ struct Options
     float lodError = 1.f; // pixels
     int lodLevel = 0;
     float zoom = 1.f;
+    bool autoRotate = false;
+    float rotateSpeed = 30.f;
 
     bool noMeshShaders = false;
     bool validation = false;
@@ -820,6 +847,8 @@ bool parseOptions(int argc, char** argv, Options& opt)
     program.add_argument("--no-frustum-cull").flag().help("disable task-shader frustum culling");
     program.add_argument("--no-cone-cull").flag().help("disable task-shader normal cone (backface) culling");
     program.add_argument("--highlight").metavar("INDEX").default_value(-1).nargs(1).scan<'i', int>().help("highlight one meshlet by index");
+    program.add_argument("--auto-rotate").flag().help("turn the object about the screen's vertical axis");
+    program.add_argument("--rotate-speed").metavar("DEG").default_value(30.f).nargs(1).scan<'g', float>().help("auto-rotate speed in degrees per second (negative: other direction)");
     program.add_argument("--zoom").metavar("F").default_value(1.f).nargs(1).scan<'g', float>().help("initial camera zoom factor");
 
     // ---- app ----
@@ -945,6 +974,10 @@ bool parseOptions(int argc, char** argv, Options& opt)
     opt.coneCull = !program.get<bool>("--no-cone-cull");
     opt.highlight = std::max(-1, program.get<int>("--highlight"));
     opt.zoom = program.get<float>("--zoom");
+    opt.autoRotate = program.get<bool>("--auto-rotate");
+    opt.rotateSpeed = program.get<float>("--rotate-speed");
+    if (program.is_used("--rotate-speed") && !opt.autoRotate)
+        std::fprintf(stderr, "warning: --rotate-speed has no effect without --auto-rotate\n");
     if (opt.zoom <= 0.f)
         return fail("--zoom must be > 0");
 
@@ -1047,6 +1080,8 @@ int main(int argc, char** argv)
     app->draw.lodThreshold = opt.lodError;
     app->draw.lodLevel = opt.lodLevel;
     app->initialZoom = opt.zoom;
+    app->autoRotate = opt.autoRotate;
+    app->rotateSpeed = opt.rotateSpeed;
 
     // --- ImGui ---
     IMGUI_CHECKVERSION();
@@ -1172,14 +1207,34 @@ int main(int argc, char** argv)
         const float sidebarPixels = std::min(app->sidebarWidth * ImGui::GetIO().DisplayFramebufferScale.x, float(ctx.swapchain.extent.width) - 1.f);
         app->draw.viewportX = sidebarPixels;
         float aspect = (float(ctx.swapchain.extent.width) - sidebarPixels) / float(ctx.swapchain.extent.height);
-        app->draw.viewProj = app->camera.viewProj(aspect);
-        app->draw.cameraPos = app->camera.eye();
+        Eigen::Vector3f viewRight, viewUp, viewBack; // camera basis, world space
+        app->camera.basis(viewRight, viewUp, viewBack);
+
+        if (app->autoRotate && app->model)
+        {
+            const float angle = app->rotateSpeed * float(M_PI / 180.0) * ImGui::GetIO().DeltaTime;
+            app->objectRotation = (Eigen::AngleAxisf(angle, viewUp) * app->objectRotation).normalized();
+        }
+
+        // The object is drawn with a model transform (rotation about its center). Shaders, bounds and
+        // the LOD BVH stay in model space, so the camera-dependent inputs are moved into model space.
+        const Eigen::Matrix3f rotation = app->objectRotation.toRotationMatrix();
+        const Eigen::Affine3f modelToWorld =
+            Eigen::Translation3f(app->rotationCenter) * Eigen::Affine3f(rotation) * Eigen::Translation3f(-app->rotationCenter);
+        const Eigen::Affine3f worldToModel = modelToWorld.inverse();
+
+        app->draw.viewProj = app->camera.viewProj(aspect) * modelToWorld.matrix();
+        app->draw.cameraPos = worldToModel * app->camera.eye();
+        app->draw.lightDir = rotation.transpose() * app->camera.lightDir();
+        app->draw.viewRight = rotation.transpose() * viewRight;
+        app->draw.viewUp = rotation.transpose() * viewUp;
+        app->draw.viewBack = rotation.transpose() * viewBack;
+
+        // frozen snapshots are in model space too, so a frozen cut stays attached to the object
         app->draw.cullViewProj = app->freezeLod ? app->frozenViewProj : app->draw.viewProj;
         app->draw.cullCameraPos = app->freezeLod ? app->frozenEye : app->draw.cameraPos;
         app->draw.zNear = app->camera.zNear();
         app->draw.lodScale = app->camera.projScale() * 0.5f * float(ctx.swapchain.extent.height);
-        app->draw.lightDir = app->camera.lightDir();
-        app->camera.basis(app->draw.viewRight, app->draw.viewUp, app->draw.viewBack);
         app->renderer.record(cmd, frameIndex, imageIndex, app->draw,
             [](VkCommandBuffer c) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), c); });
 
