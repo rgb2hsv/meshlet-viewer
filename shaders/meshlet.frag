@@ -26,6 +26,14 @@ layout(location = 0) out vec4 outColor;
 layout(constant_id = 0) const int MATCAP_COUNT = 1;
 layout(set = 0, binding = 0) uniform sampler2D matcaps[MATCAP_COUNT];
 
+// One color per DAG level, cycling every 8 levels so adjacent levels always differ.
+vec3 lodColor(uint level)
+{
+    const vec3 palette[8] = vec3[8](vec3(0.20, 0.45, 0.95), vec3(0.15, 0.75, 0.85), vec3(0.25, 0.80, 0.40), vec3(0.70, 0.85, 0.25),
+        vec3(0.98, 0.80, 0.20), vec3(0.98, 0.55, 0.15), vec3(0.92, 0.25, 0.20), vec3(0.75, 0.25, 0.70));
+    return palette[level % 8u];
+}
+
 vec3 linearToSrgb(vec3 c)
 {
     return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), c));
@@ -94,13 +102,21 @@ void main()
         color = hashColor(meshlet * 512u + triangle) * light;
     else if (g.mode == MODE_NORMAL)
         color = n * 0.5 + 0.5;
+    else if (g.mode == MODE_LOD)
+        color = lodColor(pc.lods.l[meshlet].level) * light;
     else if (g.matcap >= 0)
         color = matcapColor(g, n, viewDir);
     else
         color = vec3(0.8) * light;
 
     if ((g.flags & FLAG_WIREFRAME) != 0u)
-        color = mix(color, vec3(0.02), wireCoverage(g.wireWidth));
+    {
+        // grayscale lines whose shade follows the cluster's LOD level; the shades cycle in an
+        // order where adjacent levels always contrast, and stay dark enough for light matcaps
+        const float shades[4] = float[4](0.02, 0.38, 0.18, 0.55);
+        vec3 wireColor = vec3(shades[pc.lods.l[meshlet].level % 4u]);
+        color = mix(color, wireColor, wireCoverage(g.wireWidth));
+    }
 
     if (dimmed)
         color *= 0.15;

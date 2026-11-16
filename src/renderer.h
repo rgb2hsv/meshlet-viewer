@@ -11,7 +11,10 @@ enum class ColorMode : uint32_t
     Triangle = 1,
     Normal = 2,
     Shaded = 3,
+    LodLevel = 4,
 };
+
+constexpr uint32_t kMaxLodLevels = 32; // MAX_LOD_LEVELS in shaders/common.glsl
 
 struct DrawParams
 {
@@ -20,6 +23,15 @@ struct DrawParams
     vec3 lightDir = {0, 0, 1}; // world space, towards the light
     vec3 viewRight, viewUp, viewBack; // camera basis (world space), for matcap lookups
     int matcap = -1;                  // index into the loaded matcaps; -1 = plain lighting
+
+    // LOD selection and culling use their own camera so they can be frozen while orbiting
+    mat4 cullViewProj;
+    vec3 cullCameraPos;
+    bool lodAuto = true;       // true: pixel error threshold; false: fixed DAG level
+    float lodThreshold = 1.f;  // pixels
+    int lodLevel = 0;
+    float lodScale = 1.f;      // cot(fovY / 2) * 0.5 * viewport height
+    float zNear = 0.01f;
     ColorMode mode = ColorMode::Meshlet;
     int highlight = -1;
     bool frustumCull = true;
@@ -34,6 +46,8 @@ struct FrameStats
     uint32_t visibleMeshlets = 0;
     uint32_t visibleTriangles = 0;
     double gpuMs = 0;
+    uint32_t levelClusters[kMaxLodLevels] = {};
+    uint32_t levelTriangles[kMaxLodLevels] = {};
     bool valid = false;
 };
 
@@ -49,6 +63,8 @@ public:
     void releaseScene();
     bool hasScene() const { return meshletCount > 0; }
     bool usesMeshShaders() const { return meshPipeline != VK_NULL_HANDLE; }
+    // Cluster LOD selection runs in the task shader; the vertex fallback draws level 0 only.
+    bool supportsLod() const { return usesMeshShaders(); }
     // The vertex path passes barycentrics itself; the mesh path needs VK_KHR_fragment_shader_barycentric.
     bool supportsWireframe() const { return !usesMeshShaders() || ctx->caps.barycentric; }
     size_t gpuBytes() const { return sceneBytes; }
@@ -99,7 +115,10 @@ private:
     PerFrame frames[kFramesInFlight];
 
     Buffer vertices, meshlets, meshletVertices, meshletTriangles, bounds;
+    Buffer lods;
     Buffer fallbackIndices, fallbackTriangles;
+    uint32_t fallbackClusters = 0;  // fallback draws level 0 only
+    uint32_t fallbackTriangleCount = 0;
     uint32_t meshletCount = 0;
     uint32_t triangleCount = 0;
     size_t sceneBytes = 0;

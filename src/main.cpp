@@ -101,9 +101,12 @@ struct Camera
         distance = radius / std::sin(fovY * 0.5f) * 1.05f;
     }
 
+    float zNear() const { return radius * 0.0005f; }
+    float projScale() const { return 1.f / std::tan(fovY * 0.5f); } // cot(fovY / 2)
+
     mat4 viewProj(float aspect) const
     {
-        return perspectiveReverseZ(fovY, aspect, radius * 0.0005f) * lookAt(eye(), target, up());
+        return perspectiveReverseZ(fovY, aspect, zNear()) * lookAt(eye(), target, up());
     }
 
     void update(const ImGuiIO& io)
@@ -170,6 +173,10 @@ struct App
 
     DrawParams draw;
     std::vector<ImTextureID> matcapTextures; // ImGui handles for the selector thumbnails
+
+    bool freezeLod = false; // LOD selection + culling use a snapshot of the camera
+    mat4 frozenViewProj;
+    vec3 frozenEye;
     FrameStats stats;
 
     bool busy() const { return job.valid(); }
@@ -241,6 +248,7 @@ struct App
                 camera.frame(*model);
                 camera.distance /= initialZoom;
                 draw.wireWidth = firstLoad && wireWidthOverride > 0.f ? wireWidthOverride : model->avgEdgeLength * kAutoWireFraction;
+                freezeLod = false;
                 if (!firstLoad)
                     draw.highlight = -1; // keep --highlight for the first model
                 firstLoad = false;
@@ -252,11 +260,19 @@ struct App
 
             const MeshletData& m = *meshlets;
             const char* algorithmNames[] = {"greedy", "flex", "spatial", "scan"};
+            const char* builder = m.lod ? (settings.lodSpatial ? "lod-spatial" : "lod-flex") : algorithmNames[int(settings.algorithm)];
             std::printf("%s: %zu vertices, %zu triangles, avg edge %.4g | %s v%d t%d -> %zu meshlets, avg %.1f verts / %.1f tris, "
                         "cone-cullable %.0f%%, build %.2fs\n",
-                fileName(model->path).c_str(), model->vertices.size(), model->indices.size() / 3, model->avgEdgeLength, algorithmNames[int(settings.algorithm)],
-                settings.maxVertices, settings.maxTriangles, m.meshlets.size(), m.avgVertices, m.avgTriangles,
-                100.0 * double(m.coneCullable) / double(m.meshlets.size()), m.buildSeconds);
+                fileName(model->path).c_str(), model->vertices.size(), model->indices.size() / 3, model->avgEdgeLength, builder,
+                settings.maxVertices, settings.maxTriangles, m.levelClusters[0], m.avgVertices, m.avgTriangles,
+                100.0 * double(m.coneCullableFraction), m.buildSeconds);
+            if (m.lod)
+            {
+                std::printf("  lod: %zu levels, %zu clusters total, triangles per level:", m.levelClusters.size(), m.meshlets.size());
+                for (size_t level = 0; level < m.levelTriangles.size(); ++level)
+                    std::printf(" %zu", m.levelTriangles[level]);
+                std::printf(" (coarsest cut %zu)\n", m.coarsestTriangles);
+            }
             std::fflush(stdout);
 
             char buf[256];
@@ -326,12 +342,31 @@ void App::ui()
     if (ImGui::CollapsingHeader("Meshlet builder", ImGuiTreeNodeFlags_DefaultOpen))
     {
         bool changed = false;
-        const char* algorithms[] = {"buildMeshlets (greedy)", "buildMeshletsFlex", "buildMeshletsSpatial (RT)", "buildMeshletsScan (fast)"};
-        int algorithm = int(settings.algorithm);
-        if (ImGui::Combo("Algorithm", &algorithm, algorithms, IM_ARRAYSIZE(algorithms)))
+        changed |= ImGui::Checkbox("Build LOD hierarchy", &settings.lod);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Cluster LOD DAG (meshoptimizer clusterlod.h): groups of clusters are simplified\n"
+                              "level by level; the task shader picks a crack-free cut per frame");
+
+        if (settings.lod)
         {
-            settings.algorithm = MeshletAlgorithm(algorithm);
-            changed = true;
+            // clusterlod.h builds its own clusters with the flex or spatial builder
+            int clusterizer = settings.lodSpatial ? 1 : 0;
+            const char* clusterizers[] = {"buildMeshletsFlex", "buildMeshletsSpatial (RT)"};
+            if (ImGui::Combo("Clusterizer", &clusterizer, clusterizers, IM_ARRAYSIZE(clusterizers)))
+            {
+                settings.lodSpatial = clusterizer == 1;
+                changed = true;
+            }
+        }
+        else
+        {
+            const char* algorithms[] = {"buildMeshlets (greedy)", "buildMeshletsFlex", "buildMeshletsSpatial (RT)", "buildMeshletsScan (fast)"};
+            int algorithm = int(settings.algorithm);
+            if (ImGui::Combo("Algorithm", &algorithm, algorithms, IM_ARRAYSIZE(algorithms)))
+            {
+                settings.algorithm = MeshletAlgorithm(algorithm);
+                changed = true;
+            }
         }
 
         ImGui::SliderInt("Max vertices", &settings.maxVertices, 3, maxVertexLimit());
@@ -339,14 +374,14 @@ void App::ui()
         ImGui::SliderInt("Max triangles", &settings.maxTriangles, 4, maxTriangleLimit());
         changed |= ImGui::IsItemDeactivatedAfterEdit();
 
-        const bool flex = settings.algorithm == MeshletAlgorithm::Flex;
-        const bool spatial = settings.algorithm == MeshletAlgorithm::Spatial;
+        const bool flex = settings.lod ? !settings.lodSpatial : settings.algorithm == MeshletAlgorithm::Flex;
+        const bool spatial = settings.lod ? settings.lodSpatial : settings.algorithm == MeshletAlgorithm::Spatial;
         if (flex || spatial)
         {
             ImGui::SliderInt("Min triangles", &settings.minTriangles, 1, settings.maxTriangles);
             changed |= ImGui::IsItemDeactivatedAfterEdit();
         }
-        if (settings.algorithm == MeshletAlgorithm::Greedy || flex)
+        if (!settings.lod && (settings.algorithm == MeshletAlgorithm::Greedy || flex))
         {
             ImGui::SliderFloat("Cone weight", &settings.coneWeight, 0.f, 1.f);
             changed |= ImGui::IsItemDeactivatedAfterEdit();
@@ -360,6 +395,17 @@ void App::ui()
         {
             ImGui::SliderFloat("Fill weight", &settings.fillWeight, 0.f, 1.f);
             changed |= ImGui::IsItemDeactivatedAfterEdit();
+        }
+        if (settings.lod)
+        {
+            ImGui::SliderFloat("Simplify ratio", &settings.lodSimplifyRatio, 0.1f, 0.9f, "%.2f");
+            changed |= ImGui::IsItemDeactivatedAfterEdit();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Target triangle count of each level relative to the previous one");
+            ImGui::SliderInt("Partition size", &settings.lodPartitionSize, 2, 64);
+            changed |= ImGui::IsItemDeactivatedAfterEdit();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Clusters per group that are simplified together (larger: fewer levels, slower build)");
         }
         changed |= ImGui::Checkbox("optimizeMeshlet", &settings.optimize);
 
@@ -387,15 +433,85 @@ void App::ui()
                     ImGui::TableNextColumn();
                     ImGui::Text(fmt, args...);
                 };
-                row("Meshlets", "%s", formatCount(m.meshlets.size()).c_str());
+                if (m.lod)
+                    row("Clusters", "%s in %zu levels (%s level 0)", formatCount(m.meshlets.size()).c_str(), m.levelClusters.size(),
+                        formatCount(m.levelClusters[0]).c_str());
+                else
+                    row("Meshlets", "%s", formatCount(m.meshlets.size()).c_str());
                 row("Avg vertices", "%.1f (%.0f%% of max)", m.avgVertices, m.vertexFill * 100.f);
                 row("Avg triangles", "%.1f (%.0f%% of max)", m.avgTriangles, m.triangleFill * 100.f);
                 row("Vertex refs / vertex", "%.2f", model ? double(m.vertices.size()) / double(model->vertices.size()) : 0.0);
-                row("Cone-cullable", "%.0f%% (avg spread %.0f deg)", 100.0 * double(m.coneCullable) / double(m.meshlets.size()), m.avgConeAngleDeg);
+                row("Cone-cullable", "%.0f%% (avg spread %.0f deg)", 100.0 * double(m.coneCullableFraction), m.avgConeAngleDeg);
                 row("Build time", "%.2f s", m.buildSeconds);
                 ImGui::EndTable();
             }
         }
+    }
+
+    // ---- Level of detail ----
+    if (meshlets && meshlets->lod && ImGui::CollapsingHeader("Level of detail", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        const MeshletData& m = *meshlets;
+        const int levels = int(m.levelClusters.size());
+        ImGui::BeginDisabled(!renderer.supportsLod());
+        if (!renderer.supportsLod())
+            ImGui::TextDisabled("LOD selection needs mesh shaders; showing level 0");
+
+        int mode = draw.lodAuto ? 0 : 1;
+        ImGui::RadioButton("Auto (pixel error)", &mode, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Fixed level", &mode, 1);
+        draw.lodAuto = mode == 0;
+
+        if (draw.lodAuto)
+        {
+            ImGui::SliderFloat("Error threshold", &draw.lodThreshold, 0.1f, 64.f, "%.2f px", ImGuiSliderFlags_Logarithmic);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Largest allowed simplification error on screen, in pixels");
+        }
+        else
+        {
+            draw.lodLevel = std::clamp(draw.lodLevel, 0, levels - 1);
+            ImGui::SliderInt("Level", &draw.lodLevel, 0, levels - 1);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Clusters of one DAG level, plus clusters below it that could not be simplified further");
+        }
+
+        if (ImGui::Checkbox("Freeze LOD + culling camera", &freezeLod) && freezeLod)
+        {
+            frozenViewProj = draw.cullViewProj;
+            frozenEye = draw.cullCameraPos;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Keep the current cut and culling while orbiting, to inspect it from elsewhere");
+        ImGui::EndDisabled();
+
+        if (ImGui::BeginTable("lodlevels", 4, ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg))
+        {
+            ImGui::TableSetupColumn("Level");
+            ImGui::TableSetupColumn("Clusters");
+            ImGui::TableSetupColumn("Triangles");
+            ImGui::TableSetupColumn("Drawn tris");
+            ImGui::TableHeadersRow();
+            for (int level = 0; level < levels; ++level)
+            {
+                const bool drawn = stats.valid && level < int(kMaxLodLevels) && stats.levelClusters[level] > 0;
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::Text("%d", level);
+                ImGui::TableNextColumn();
+                ImGui::Text("%s", formatCount(m.levelClusters[size_t(level)]).c_str());
+                ImGui::TableNextColumn();
+                ImGui::Text("%s", formatCount(m.levelTriangles[size_t(level)]).c_str());
+                ImGui::TableNextColumn();
+                if (drawn)
+                    ImGui::Text("%s", formatCount(stats.levelTriangles[level]).c_str());
+                else
+                    ImGui::TextDisabled("-");
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TextDisabled("Coarsest cut: %s triangles", formatCount(m.coarsestTriangles).c_str());
     }
 
     // ---- Rendering ----
@@ -405,7 +521,7 @@ void App::ui()
         ImGui::TextDisabled("%s", renderer.usesMeshShaders() ? "Pipeline: task + mesh shaders (VK_EXT_mesh_shader)"
                                                              : "Pipeline: vertex shader fallback (no culling)");
 
-        const char* modes[] = {"Meshlet", "Triangle", "Normal", "Shaded"};
+        const char* modes[] = {"Meshlet", "Triangle", "Normal", "Shaded", "LOD level"};
         int mode = int(draw.mode);
         if (ImGui::Combo("Color", &mode, modes, IM_ARRAYSIZE(modes)))
             draw.mode = ColorMode(mode);
@@ -601,11 +717,14 @@ struct Options
 
     ColorMode colorMode = ColorMode::Meshlet;
     std::string matcap = "clay_studio"; // Blender matcap for --color shaded; "none" = plain lighting
-    bool wireframe = false;
+    bool wireframe = true;
     float wireWidth = 0.f; // model units; 0 = automatic
     bool frustumCull = true;
     bool coneCull = true;
     int highlight = -1;
+    bool lodAuto = true;
+    float lodError = 1.f; // pixels
+    int lodLevel = 0;
     float zoom = 1.f;
 
     bool noMeshShaders = false;
@@ -619,7 +738,7 @@ bool parseOptions(int argc, char** argv, Options& opt)
 {
     argparse::ArgumentParser program("meshlets", "0.1.0");
     program.add_description("Splits a PLY/OBJ model into meshlets with meshoptimizer and visualizes them with Vulkan mesh shaders.");
-    program.add_epilog("Example:\n  meshlets assets/model/metasphere.ply --algorithm flex --max-vertices 128 --max-triangles 128 --min-triangles 64");
+    program.add_epilog("Examples:\n  meshlets assets/model/metasphere.ply --lod-error 2 -c lod\n  meshlets assets/model/metasphere.ply --no-lod --algorithm flex --max-vertices 128 --max-triangles 128 --min-triangles 64");
 
     // ---- input ----
     program.add_group("Input");
@@ -644,11 +763,19 @@ bool parseOptions(int argc, char** argv, Options& opt)
     program.add_argument("--fill-weight").metavar("W").default_value(defaults.fillWeight).nargs(1).scan<'g', float>().help("prefer fuller clusters over SAH quality [0, 1] (spatial)");
     program.add_argument("--no-optimize-meshlets").flag().help("skip meshopt_optimizeMeshlet on each meshlet");
 
+    program.add_group("Level of detail");
+    program.add_argument("--no-lod").flag().help("build a single meshlet level with --algorithm instead of the cluster LOD hierarchy (meshoptimizer clusterlod.h)");
+    program.add_argument("--lod-spatial").flag().help("cluster with buildMeshletsSpatial instead of buildMeshletsFlex");
+    program.add_argument("--lod-ratio").metavar("R").default_value(defaults.lodSimplifyRatio).nargs(1).scan<'g', float>().help("target triangle ratio per level [0.1, 0.9]");
+    program.add_argument("--lod-partition").metavar("N").default_value(defaults.lodPartitionSize).nargs(1).scan<'i', int>().help("clusters per simplification group [2, 64]");
+    program.add_argument("--lod-error").metavar("PX").default_value(1.f).nargs(1).scan<'g', float>().help("pixel error threshold for automatic LOD selection");
+    program.add_argument("--lod-level").metavar("N").default_value(-1).nargs(1).scan<'i', int>().help("show a fixed DAG level instead of automatic selection");
+
     // ---- view ----
     program.add_group("View");
-    program.add_argument("-c", "--color").default_value(std::string("meshlet")).nargs(1).choices("meshlet", "triangle", "normal", "shaded").help("color mode");
+    program.add_argument("-c", "--color").default_value(std::string("meshlet")).nargs(1).choices("meshlet", "triangle", "normal", "shaded", "lod").help("color mode");
     program.add_argument("--matcap").metavar("NAME").default_value(std::string("clay_studio")).nargs(1).help("Blender matcap from assets/matcap for --color shaded (file name without .png, or none)");
-    program.add_argument("--wireframe").flag().help("draw a wireframe overlay");
+    program.add_argument("--no-wireframe").flag().help("hide the wireframe overlay");
     program.add_argument("--wire-width").metavar("W").default_value(0.f).nargs(1).scan<'g', float>().help("wireframe line width in model units (0 = 10% of the average edge length)");
     program.add_argument("--no-frustum-cull").flag().help("disable task-shader frustum culling");
     program.add_argument("--no-cone-cull").flag().help("disable task-shader normal cone (backface) culling");
@@ -705,6 +832,27 @@ bool parseOptions(int argc, char** argv, Options& opt)
     m.splitFactor = program.get<float>("--split-factor");
     m.fillWeight = program.get<float>("--fill-weight");
     m.optimize = !program.get<bool>("--no-optimize-meshlets");
+    m.lod = !program.get<bool>("--no-lod");
+    m.lodSpatial = program.get<bool>("--lod-spatial");
+    m.lodSimplifyRatio = program.get<float>("--lod-ratio");
+    m.lodPartitionSize = program.get<int>("--lod-partition");
+    opt.lodError = program.get<float>("--lod-error");
+    opt.lodLevel = program.get<int>("--lod-level");
+    opt.lodAuto = opt.lodLevel < 0;
+    opt.lodLevel = std::max(opt.lodLevel, 0);
+    if (m.lodSimplifyRatio < 0.1f || m.lodSimplifyRatio > 0.9f)
+        return fail("--lod-ratio must be in [0.1, 0.9]");
+    if (m.lodPartitionSize < 2 || m.lodPartitionSize > 64)
+        return fail("--lod-partition must be in [2, 64]");
+    if (opt.lodError <= 0.f)
+        return fail("--lod-error must be > 0");
+    if (program.is_used("--lod-error") && program.is_used("--lod-level"))
+        return fail("--lod-error (automatic) and --lod-level (fixed) are mutually exclusive");
+    for (const char* name : {"--lod-spatial", "--lod-ratio", "--lod-partition", "--lod-error", "--lod-level"})
+        if (program.is_used(name) && !m.lod)
+            std::fprintf(stderr, "warning: %s has no effect with --no-lod\n", name);
+    if (m.lod && program.is_used("--algorithm"))
+        std::fprintf(stderr, "warning: --algorithm has no effect with the LOD hierarchy (add --no-lod, or use --lod-spatial)\n");
 
     if (m.maxVertices < 3 || m.maxVertices > 256)
         return fail("--max-vertices must be in [3, 256]");
@@ -723,13 +871,15 @@ bool parseOptions(int argc, char** argv, Options& opt)
     if (m.fillWeight < 0.f || m.fillWeight > 1.f)
         return fail("--fill-weight must be in [0, 1]");
 
+    const std::string builderName = m.lod ? (m.lodSpatial ? "the LOD hierarchy and --lod-spatial" : "the LOD hierarchy") : "--no-lod --algorithm " + algorithm;
     auto warnUnused = [&](const char* name, bool usedBy) {
         if (program.is_used(name) && !usedBy)
-            std::fprintf(stderr, "warning: %s has no effect with --algorithm %s\n", name, algorithm.c_str());
+            std::fprintf(stderr, "warning: %s has no effect with %s\n", name, builderName.c_str());
     };
-    const bool flex = m.algorithm == MeshletAlgorithm::Flex, spatial = m.algorithm == MeshletAlgorithm::Spatial;
+    const bool flex = m.lod ? !m.lodSpatial : m.algorithm == MeshletAlgorithm::Flex;
+    const bool spatial = m.lod ? m.lodSpatial : m.algorithm == MeshletAlgorithm::Spatial;
     warnUnused("--min-triangles", flex || spatial);
-    warnUnused("--cone-weight", flex || m.algorithm == MeshletAlgorithm::Greedy);
+    warnUnused("--cone-weight", !m.lod && (flex || m.algorithm == MeshletAlgorithm::Greedy));
     warnUnused("--split-factor", flex);
     warnUnused("--fill-weight", spatial);
 
@@ -741,13 +891,14 @@ bool parseOptions(int argc, char** argv, Options& opt)
     opt.colorMode = color == "triangle" ? ColorMode::Triangle
                     : color == "normal" ? ColorMode::Normal
                     : color == "shaded" ? ColorMode::Shaded
+                    : color == "lod"    ? ColorMode::LodLevel
                                         : ColorMode::Meshlet;
-    opt.wireframe = program.get<bool>("--wireframe");
+    opt.wireframe = !program.get<bool>("--no-wireframe");
     opt.wireWidth = program.get<float>("--wire-width");
     if (opt.wireWidth < 0.f)
         return fail("--wire-width must be >= 0");
     if (program.is_used("--wire-width") && !opt.wireframe)
-        std::fprintf(stderr, "warning: --wire-width has no effect without --wireframe\n");
+        std::fprintf(stderr, "warning: --wire-width has no effect with --no-wireframe\n");
     opt.frustumCull = !program.get<bool>("--no-frustum-cull");
     opt.coneCull = !program.get<bool>("--no-cone-cull");
     opt.highlight = std::max(-1, program.get<int>("--highlight"));
@@ -849,6 +1000,9 @@ int main(int argc, char** argv)
     app->draw.frustumCull = opt.frustumCull;
     app->draw.coneCull = opt.coneCull;
     app->draw.highlight = opt.highlight;
+    app->draw.lodAuto = opt.lodAuto;
+    app->draw.lodThreshold = opt.lodError;
+    app->draw.lodLevel = opt.lodLevel;
     app->initialZoom = opt.zoom;
 
     // --- ImGui ---
@@ -974,6 +1128,10 @@ int main(int argc, char** argv)
         float aspect = float(ctx.swapchain.extent.width) / float(ctx.swapchain.extent.height);
         app->draw.viewProj = app->camera.viewProj(aspect);
         app->draw.cameraPos = app->camera.eye();
+        app->draw.cullViewProj = app->freezeLod ? app->frozenViewProj : app->draw.viewProj;
+        app->draw.cullCameraPos = app->freezeLod ? app->frozenEye : app->draw.cameraPos;
+        app->draw.zNear = app->camera.zNear();
+        app->draw.lodScale = app->camera.projScale() * 0.5f * float(ctx.swapchain.extent.height);
         app->draw.lightDir = app->camera.lightDir();
         app->camera.basis(app->draw.viewRight, app->draw.viewUp, app->draw.viewBack);
         app->renderer.record(cmd, frameIndex, imageIndex, app->draw,

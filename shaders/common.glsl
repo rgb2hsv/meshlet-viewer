@@ -18,6 +18,12 @@
 #define MODE_TRIANGLE 1u
 #define MODE_NORMAL 2u
 #define MODE_SHADED 3u
+#define MODE_LOD 4u
+
+#define LOD_AUTO 0u  // screen-space error threshold
+#define LOD_FIXED 1u // one DAG level (plus terminal clusters below it)
+#define MAX_LOD_LEVELS 32u
+#define TERMINAL_ERROR 3.0e38 // clusters with nothing coarser store FLT_MAX
 
 struct Vertex
 {
@@ -43,10 +49,24 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Ver
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer MeshletBuffer { Meshlet m[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer BoundsBuffer { Bounds b[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer UintBuffer { uint d[]; };
+struct MeshletLod
+{
+    vec4 selfSphere;   // xyz center, w radius: bounds of this cluster's own error
+    vec4 coarseSphere; // bounds of the coarser clusters that would replace it
+    float selfError;   // model units; 0 for full detail
+    float coarseError; // model units; FLT_MAX when nothing coarser exists
+    uint level;
+    uint pad;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer LodBuffer { MeshletLod l[]; };
+
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer StatsBuffer
 {
     uint visibleMeshlets;
     uint visibleTriangles;
+    uint levelClusters[MAX_LOD_LEVELS];
+    uint levelTriangles[MAX_LOD_LEVELS];
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Globals
@@ -65,6 +85,11 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Gl
     vec4 viewRight;   // camera basis in world space (view-space x, y, z)
     vec4 viewUp;
     vec4 viewBack;
+    vec4 lodCamera;   // xyz: camera used for LOD + culling (may be frozen), w: near plane
+    float lodScale;   // cot(fovY / 2) * 0.5 * viewport height: model-space error -> pixels
+    float lodThreshold; // pixels
+    uint lodMode;     // LOD_AUTO or LOD_FIXED
+    uint lodLevel;    // LOD_FIXED level
 };
 
 layout(push_constant) uniform PushConstants
@@ -78,6 +103,7 @@ layout(push_constant) uniform PushConstants
     UintBuffer fallbackIndices;   // vertex path: global vertex index per corner
     UintBuffer fallbackTriangles; // vertex path: packed meshlet/triangle id per triangle
     StatsBuffer stats;
+    LodBuffer lods;
 } pc;
 
 // Altitudes of triangle (a, b, c): distance from each vertex to its opposite edge.

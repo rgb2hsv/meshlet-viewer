@@ -45,6 +45,28 @@ struct MeshletSettings
     float splitFactor = 2.0f; // Flex
     float fillWeight = 0.5f;  // Spatial
     bool optimize = true;     // meshopt_optimizeMeshlet
+
+    // Cluster LOD (meshoptimizer demo/clusterlod.h): builds a DAG of progressively
+    // simplified clusters instead of a single meshlet level. Uses maxVertices,
+    // min/maxTriangles; the clusterizer is flex (splitFactor) or spatial (fillWeight).
+    bool lod = true;
+    bool lodSpatial = false;        // clodConfig::cluster_spatial
+    float lodSimplifyRatio = 0.5f;  // target triangle reduction per level
+    int lodPartitionSize = 16;      // clusters per group that get simplified together
+};
+
+// Per-cluster LOD selection data (std430 layout, 48 bytes). A cluster is drawn when the
+// projected coarse error is above the threshold and the projected own error is at or below it.
+struct MeshletLod
+{
+    float selfCenter[3];   // bounds of this cluster's own simplification error
+    float selfRadius;
+    float coarseCenter[3]; // bounds of the coarser clusters that would replace this one
+    float coarseRadius;
+    float selfError;       // 0 for full-detail clusters
+    float coarseError;     // FLT_MAX when nothing coarser exists (terminal)
+    uint32_t level;        // DAG depth of the cluster's group
+    uint32_t pad;
 };
 
 // GPU-friendly bounds: sphere + normal cone (std430 layout, 32 bytes)
@@ -62,13 +84,19 @@ struct MeshletData
     std::vector<uint32_t> vertices;  // meshlet-local -> global vertex index
     std::vector<uint8_t> triangles;  // 3 local indices per triangle, padded to a multiple of 4 bytes
     std::vector<MeshletBounds> bounds;
+    std::vector<MeshletLod> lods; // one per meshlet; level 0 + "always selected" without LOD
 
     double buildSeconds = 0;
-    size_t triangleCount = 0;
-    float avgVertices = 0, avgTriangles = 0;
+    size_t triangleCount = 0;     // all levels
+    size_t baseTriangleCount = 0; // level 0
+    bool lod = false;
+    std::vector<size_t> levelClusters, levelTriangles; // per DAG level
+    size_t coarsestTriangles = 0; // triangles in the coarsest possible cut (terminal clusters)
+    float avgVertices = 0, avgTriangles = 0; // level 0
     float vertexFill = 0, triangleFill = 0; // average utilisation of max sizes
     float avgConeAngleDeg = 0; // average normal-cone spread of cullable meshlets
-    size_t coneCullable = 0; // meshlets whose cone cutoff < 1 (can be backface culled)
+    size_t coneCullable = 0; // level-0 meshlets whose cone cutoff < 1 (can be backface culled)
+    float coneCullableFraction = 0;
 };
 
 bool buildMeshlets(const Model& model, const MeshletSettings& settings, MeshletData& out, std::string& error);

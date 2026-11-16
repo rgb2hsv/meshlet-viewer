@@ -49,6 +49,4 @@ void main()
         outAltitudes[t] = triangleAltitudes(sharedPositions[tri.x], sharedPositions[tri.y], sharedPositions[tri.z]);
     }
 
-    if (gl_LocalInvocationIndex == 0)
-        atomicAdd(pc.stats.visibleTriangles, m.triangleCount);
 }

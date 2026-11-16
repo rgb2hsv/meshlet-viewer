@@ -1,5 +1,6 @@
 #include "renderer.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
@@ -33,8 +34,13 @@ struct GpuGlobals
     float viewRight[4];
     float viewUp[4];
     float viewBack[4];
+    float lodCamera[4];
+    float lodScale;
+    float lodThreshold;
+    uint32_t lodMode;
+    uint32_t lodLevel;
 };
-static_assert(sizeof(GpuGlobals) == 240, "GpuGlobals layout mismatch");
+static_assert(sizeof(GpuGlobals) == 272, "GpuGlobals layout mismatch");
 
 // Must match `PushConstants` in shaders/common.glsl
 struct PushConstants
@@ -48,12 +54,15 @@ struct PushConstants
     VkDeviceAddress fallbackIndices;
     VkDeviceAddress fallbackTriangles;
     VkDeviceAddress stats;
+    VkDeviceAddress lods;
 };
 
 struct GpuStats
 {
     uint32_t visibleMeshlets;
     uint32_t visibleTriangles;
+    uint32_t levelClusters[kMaxLodLevels];
+    uint32_t levelTriangles[kMaxLodLevels];
 };
 
 constexpr uint32_t kTriBits = 9; // TRI_BITS in common.glsl
@@ -314,13 +323,17 @@ void MeshletRenderer::upload(const Model& model, const MeshletData& data)
     }
     else
     {
-        // Vertex fallback: expand meshlets into a flat corner list + per-triangle ids
+        // Vertex fallback: expand the level-0 meshlets into a flat corner list + per-triangle ids
         std::vector<uint32_t> indices;
         std::vector<uint32_t> triangles;
-        indices.reserve(data.triangleCount * 3);
-        triangles.reserve(data.triangleCount);
+        indices.reserve(data.baseTriangleCount * 3);
+        triangles.reserve(data.baseTriangleCount);
+        fallbackClusters = 0;
         for (size_t mi = 0; mi < data.meshlets.size(); ++mi)
         {
+            if (data.lods[mi].level != 0)
+                continue;
+            fallbackClusters++;
             const meshopt_Meshlet& m = data.meshlets[mi];
             for (uint32_t t = 0; t < m.triangle_count; ++t)
             {
@@ -331,11 +344,13 @@ void MeshletRenderer::upload(const Model& model, const MeshletData& data)
         }
         fallbackIndices = ctx->createDeviceBuffer(indices.data(), indices.size() * sizeof(uint32_t), usage);
         fallbackTriangles = ctx->createDeviceBuffer(triangles.data(), triangles.size() * sizeof(uint32_t), usage);
+        fallbackTriangleCount = uint32_t(triangles.size());
     }
+    lods = ctx->createDeviceBuffer(data.lods.data(), data.lods.size() * sizeof(MeshletLod), usage); // also read by the fragment shader
 
     meshletCount = uint32_t(data.meshlets.size());
     triangleCount = uint32_t(data.triangleCount);
-    sceneBytes = size_t(vertices.size + meshlets.size + meshletVertices.size + meshletTriangles.size + bounds.size +
+    sceneBytes = size_t(vertices.size + meshlets.size + meshletVertices.size + meshletTriangles.size + bounds.size + lods.size +
                         fallbackIndices.size + fallbackTriangles.size);
 }
 
@@ -345,9 +360,10 @@ void MeshletRenderer::releaseScene()
         return;
     if (vertices.buffer)
         VK_CHECK(vkDeviceWaitIdle(ctx->device));
-    for (Buffer* buffer : {&vertices, &meshlets, &meshletVertices, &meshletTriangles, &bounds, &fallbackIndices, &fallbackTriangles})
+    for (Buffer* buffer : {&vertices, &meshlets, &meshletVertices, &meshletTriangles, &bounds, &lods, &fallbackIndices, &fallbackTriangles})
         ctx->destroyBuffer(*buffer);
     meshletCount = triangleCount = 0;
+    fallbackClusters = fallbackTriangleCount = 0;
     sceneBytes = 0;
 }
 
@@ -361,6 +377,8 @@ FrameStats MeshletRenderer::collectStats(uint32_t frameIndex)
     const GpuStats* stats = static_cast<const GpuStats*>(frame.stats.mapped);
     result.visibleMeshlets = stats->visibleMeshlets;
     result.visibleTriangles = stats->visibleTriangles;
+    std::memcpy(result.levelClusters, stats->levelClusters, sizeof(result.levelClusters));
+    std::memcpy(result.levelTriangles, stats->levelTriangles, sizeof(result.levelTriangles));
 
     uint64_t ticks[2] = {};
     if (vkGetQueryPoolResults(ctx->device, timestamps, frameIndex * 2, 2, sizeof(ticks), ticks, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) ==
@@ -379,7 +397,7 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     // per-frame constants (frame fence has been waited on, so the buffers are free)
     GpuGlobals globals = {};
     std::memcpy(globals.viewProj, params.viewProj.m, sizeof(globals.viewProj));
-    extractFrustum(params.viewProj, globals.frustum);
+    extractFrustum(params.cullViewProj, globals.frustum);
     globals.cameraPos[0] = params.cameraPos.x;
     globals.cameraPos[1] = params.cameraPos.y;
     globals.cameraPos[2] = params.cameraPos.z;
@@ -401,13 +419,23 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
         basisOut[i][1] = basis[i].y;
         basisOut[i][2] = basis[i].z;
     }
+
+    globals.lodCamera[0] = params.cullCameraPos.x;
+    globals.lodCamera[1] = params.cullCameraPos.y;
+    globals.lodCamera[2] = params.cullCameraPos.z;
+    globals.lodCamera[3] = params.zNear;
+    globals.lodScale = params.lodScale;
+    globals.lodThreshold = params.lodThreshold;
+    globals.lodMode = params.lodAuto ? 0u : 1u;
+    globals.lodLevel = uint32_t(std::max(params.lodLevel, 0));
     std::memcpy(frame.globals.mapped, &globals, sizeof(globals));
 
     GpuStats zero = {};
     if (!usesMeshShaders())
     {
-        zero.visibleMeshlets = meshletCount; // no culling in the fallback path
-        zero.visibleTriangles = triangleCount;
+        // no culling or LOD in the fallback path: level 0 is always drawn in full
+        zero.visibleMeshlets = zero.levelClusters[0] = fallbackClusters;
+        zero.visibleTriangles = zero.levelTriangles[0] = fallbackTriangleCount;
     }
     std::memcpy(frame.stats.mapped, &zero, sizeof(zero));
     frame.submitted = true;
@@ -464,6 +492,7 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     push.fallbackIndices = fallbackIndices.address;
     push.fallbackTriangles = fallbackTriangles.address;
     push.stats = frame.stats.address;
+    push.lods = lods.address;
 
     const uint32_t taskGroups = (meshletCount + kTaskGroupSize - 1) / kTaskGroupSize;
 
@@ -474,7 +503,7 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     if (usesMeshShaders())
         vkCmdDrawMeshTasksEXT(cmd, taskGroups, 1, 1);
     else
-        vkCmdDraw(cmd, triangleCount * 3, 1, 0, 0);
+        vkCmdDraw(cmd, fallbackTriangleCount * 3, 1, 0, 0);
 }
 
 void MeshletRenderer::end(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t imageIndex)

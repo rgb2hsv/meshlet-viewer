@@ -1,10 +1,14 @@
 #include "model.h"
 
+#define CLUSTERLOD_IMPLEMENTATION
+#include "../external/meshoptimizer/demo/clusterlod.h"
+
 #define FAST_OBJ_IMPLEMENTATION
 #include "../external/meshoptimizer/extern/fast_obj.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -609,6 +613,82 @@ void computeNormals(Model& model)
     });
 }
 
+bool buildSingleLevel(const Model& model, const MeshletSettings& s, size_t maxVertices, size_t minTriangles, size_t maxTriangles,
+    MeshletData& out, std::string& error);
+
+// Builds a cluster LOD DAG with clusterlod.h; appends every cluster of every level as a meshlet.
+bool buildLodClusters(const Model& model, const MeshletSettings& s, size_t maxVertices, size_t minTriangles, size_t maxTriangles,
+    MeshletData& out, std::string& error)
+{
+    maxTriangles = std::clamp<size_t>(maxTriangles, 4, 256); // clodDefaultConfig limits
+    clodConfig config = clodDefaultConfig(maxTriangles);
+    config.max_vertices = maxVertices;
+    config.min_triangles = std::min(minTriangles, maxTriangles);
+    config.cluster_spatial = s.lodSpatial;
+    config.cluster_split_factor = s.splitFactor;
+    config.cluster_fill_weight = s.fillWeight;
+    config.partition_size = size_t(std::max(2, s.lodPartitionSize));
+    config.simplify_ratio = std::clamp(s.lodSimplifyRatio, 0.05f, 0.95f);
+    config.optimize_clusters = s.optimize;
+
+    // normals as simplification attributes (also required by permissive simplification)
+    const float attributeWeights[3] = {0.5f, 0.5f, 0.5f};
+    clodMesh mesh = {};
+    mesh.indices = model.indices.data();
+    mesh.index_count = model.indices.size();
+    mesh.vertex_count = model.vertices.size();
+    mesh.vertex_positions = &model.vertices[0].px;
+    mesh.vertex_positions_stride = sizeof(Vertex);
+    mesh.vertex_attributes = &model.vertices[0].nx;
+    mesh.vertex_attributes_stride = sizeof(Vertex);
+    mesh.attribute_weights = attributeWeights;
+    mesh.attribute_count = 3;
+
+    std::vector<clodGroup> groups;
+    clodBuild(config, mesh, [&](clodGroup group, const clodCluster* clusters, size_t clusterCount) -> int {
+        const int groupIndex = int(groups.size());
+        groups.push_back(group);
+
+        for (size_t i = 0; i < clusterCount; ++i)
+        {
+            const clodCluster& cluster = clusters[i];
+
+            meshopt_Meshlet m = {};
+            m.vertex_offset = unsigned(out.vertices.size());
+            m.triangle_offset = unsigned(out.triangles.size());
+            m.triangle_count = unsigned(cluster.index_count / 3);
+            out.vertices.resize(out.vertices.size() + cluster.vertex_count);
+            out.triangles.resize(out.triangles.size() + cluster.index_count);
+            m.vertex_count = unsigned(clodLocalIndices(&out.vertices[m.vertex_offset], &out.triangles[m.triangle_offset], cluster.indices,
+                cluster.index_count));
+            out.meshlets.push_back(m);
+
+            MeshletLod lod = {};
+            if (cluster.refined >= 0)
+            {
+                const clodBounds& self = groups[size_t(cluster.refined)].simplified;
+                std::memcpy(lod.selfCenter, self.center, sizeof(lod.selfCenter));
+                lod.selfRadius = self.radius;
+                lod.selfError = self.error;
+            }
+            std::memcpy(lod.coarseCenter, group.simplified.center, sizeof(lod.coarseCenter));
+            lod.coarseRadius = group.simplified.radius;
+            lod.coarseError = group.simplified.error; // FLT_MAX for terminal groups
+            lod.level = uint32_t(group.depth);
+            out.lods.push_back(lod);
+        }
+        return groupIndex;
+    });
+
+    if (out.meshlets.empty())
+    {
+        error = "cluster LOD builder produced no clusters";
+        return false;
+    }
+    out.triangles.resize((out.triangles.size() + 3) & ~size_t(3));
+    return true;
+}
+
 } // namespace
 
 bool loadModel(const std::string& path, Model& model, std::string& error, bool optimizeVertexCache)
@@ -699,6 +779,88 @@ bool buildMeshlets(const Model& model, const MeshletSettings& s, MeshletData& ou
         return false;
     }
 
+    if (s.lod)
+    {
+        if (!buildLodClusters(model, s, maxVertices, minTriangles, maxTriangles, out, error))
+            return false;
+    }
+    else if (!buildSingleLevel(model, s, maxVertices, minTriangles, maxTriangles, out, error))
+        return false;
+
+    const size_t count = out.meshlets.size();
+    const bool optimizeHere = s.optimize && !s.lod; // clodBuild already optimized its clusters
+
+    out.bounds.resize(count);
+    parallelFor(count, [&](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i)
+        {
+            const meshopt_Meshlet& m = out.meshlets[i];
+            if (optimizeHere)
+                meshopt_optimizeMeshlet(&out.vertices[m.vertex_offset], &out.triangles[m.triangle_offset], m.triangle_count, m.vertex_count);
+
+            meshopt_Bounds b = meshopt_computeMeshletBounds(&out.vertices[m.vertex_offset], &out.triangles[m.triangle_offset],
+                m.triangle_count, positions, vertexCount, stride);
+            MeshletBounds& gb = out.bounds[i];
+            std::memcpy(gb.center, b.center, sizeof(gb.center));
+            gb.radius = b.radius;
+            std::memcpy(gb.coneAxis, b.cone_axis, sizeof(gb.coneAxis));
+            gb.coneCutoff = b.cone_cutoff;
+        }
+    });
+
+    // statistics: sizes and cones over level 0 (comparable with and without LOD), counts per level
+    size_t baseClusters = 0, baseVertices = 0;
+    double coneAngles = 0;
+    for (size_t i = 0; i < count; ++i)
+    {
+        const meshopt_Meshlet& m = out.meshlets[i];
+        const MeshletLod& lod = out.lods[i];
+        out.triangleCount += m.triangle_count;
+        if (lod.level >= out.levelClusters.size())
+        {
+            out.levelClusters.resize(lod.level + 1);
+            out.levelTriangles.resize(lod.level + 1);
+        }
+        out.levelClusters[lod.level]++;
+        out.levelTriangles[lod.level] += m.triangle_count;
+        if (lod.coarseError == FLT_MAX)
+            out.coarsestTriangles += m.triangle_count;
+        if (lod.level != 0)
+            continue;
+
+        baseClusters++;
+        baseVertices += m.vertex_count;
+        out.baseTriangleCount += m.triangle_count;
+        float cutoff = out.bounds[i].coneCutoff;
+        if (cutoff < 1.f)
+        {
+            out.coneCullable++;
+            coneAngles += 2.0 * std::asin(double(std::clamp(cutoff, 0.f, 1.f))) * 180.0 / M_PI; // cutoff = sin(half-angle)
+        }
+    }
+    out.lod = s.lod;
+    out.avgVertices = float(double(baseVertices) / double(baseClusters));
+    out.avgTriangles = float(double(out.baseTriangleCount) / double(baseClusters));
+    out.vertexFill = out.avgVertices / float(maxVertices);
+    out.triangleFill = out.avgTriangles / float(maxTriangles);
+    out.avgConeAngleDeg = out.coneCullable ? float(coneAngles / double(out.coneCullable)) : 0.f;
+    out.coneCullableFraction = float(double(out.coneCullable) / double(baseClusters));
+    out.buildSeconds = secondsSince(start);
+    return true;
+}
+
+namespace
+{
+
+// Single meshlet level with one of the meshopt_buildMeshlets* builders.
+bool buildSingleLevel(const Model& model, const MeshletSettings& s, size_t maxVertices, size_t minTriangles, size_t maxTriangles,
+    MeshletData& out, std::string& error)
+{
+    const size_t indexCount = model.indices.size();
+    const size_t vertexCount = model.vertices.size();
+    const float* positions = &model.vertices[0].px;
+    const size_t stride = sizeof(Vertex);
+
     const bool usesMin = s.algorithm == MeshletAlgorithm::Flex || s.algorithm == MeshletAlgorithm::Spatial;
     size_t bound = meshopt_buildMeshletsBound(indexCount, maxVertices, usesMin ? minTriangles : maxTriangles);
 
@@ -738,43 +900,10 @@ bool buildMeshlets(const Model& model, const MeshletSettings& s, MeshletData& ou
     out.vertices.resize(last.vertex_offset + last.vertex_count);
     out.triangles.resize((last.triangle_offset + last.triangle_count * 3 + 3) & ~size_t(3));
 
-    out.bounds.resize(count);
-    parallelFor(count, [&](size_t begin, size_t end) {
-        for (size_t i = begin; i < end; ++i)
-        {
-            const meshopt_Meshlet& m = out.meshlets[i];
-            if (s.optimize)
-                meshopt_optimizeMeshlet(&out.vertices[m.vertex_offset], &out.triangles[m.triangle_offset], m.triangle_count, m.vertex_count);
-
-            meshopt_Bounds b = meshopt_computeMeshletBounds(&out.vertices[m.vertex_offset], &out.triangles[m.triangle_offset],
-                m.triangle_count, positions, vertexCount, stride);
-            MeshletBounds& gb = out.bounds[i];
-            std::memcpy(gb.center, b.center, sizeof(gb.center));
-            gb.radius = b.radius;
-            std::memcpy(gb.coneAxis, b.cone_axis, sizeof(gb.coneAxis));
-            gb.coneCutoff = b.cone_cutoff;
-        }
-    });
-
-    size_t totalVertices = 0, totalTriangles = 0;
-    double coneAngles = 0;
-    for (size_t i = 0; i < count; ++i)
-    {
-        totalVertices += out.meshlets[i].vertex_count;
-        totalTriangles += out.meshlets[i].triangle_count;
-        float cutoff = out.bounds[i].coneCutoff;
-        if (cutoff < 1.f)
-        {
-            out.coneCullable++;
-            coneAngles += 2.0 * std::asin(double(std::clamp(cutoff, 0.f, 1.f))) * 180.0 / M_PI; // cutoff = sin(half-angle)
-        }
-    }
-    out.triangleCount = totalTriangles;
-    out.avgVertices = float(double(totalVertices) / double(count));
-    out.avgTriangles = float(double(totalTriangles) / double(count));
-    out.vertexFill = out.avgVertices / float(maxVertices);
-    out.triangleFill = out.avgTriangles / float(maxTriangles);
-    out.avgConeAngleDeg = out.coneCullable ? float(coneAngles / double(out.coneCullable)) : 0.f;
-    out.buildSeconds = secondsSince(start);
+    MeshletLod always = {}; // level 0, nothing coarser: always selected
+    always.coarseError = FLT_MAX;
+    out.lods.assign(count, always);
     return true;
 }
+
+} // namespace

@@ -8,10 +8,16 @@ The UI is Dear ImGui on GLFW.
 - Task shader: per-meshlet frustum and normal-cone (backface) culling
 - Mesh shader: one workgroup per meshlet, up to 256 vertices / 256 triangles
 - Color by meshlet, triangle or normal, or Shaded with any of Blender's matcaps (thumbnail selector)
-- Wireframe drawn in the fragment shader with a line width in model units (it scales with
-  the mesh, not the screen; anti-aliased, fading out when thinner than a pixel)
+- Wireframe (on by default) drawn in the fragment shader with a line width in model units (it scales with
+  the mesh, not the screen; anti-aliased, fading out when thinner than a pixel). Lines are
+  grayscale, with a shade per LOD level, so the current cut is visible in every color mode
 - Meshlet inspector: highlight one meshlet by index
 - Meshlet builders: `buildMeshlets`, `buildMeshletsFlex`, `buildMeshletsSpatial`, `buildMeshletsScan`
+- Cluster LOD (Nanite-style, on by default; `--no-lod` for a single meshlet level) with meshoptimizer's `demo/clusterlod.h`: a DAG of progressively
+  simplified clusters. The task shader picks a crack-free cut per frame from a pixel error
+  threshold, or shows a fixed level. You can freeze the LOD + culling camera to inspect the cut
+  from elsewhere, color by LOD level, and see per-level cluster/triangle stats. Lucy: 19 levels,
+  45 s single-threaded build; the full view draws ~85K of 28M triangles at 1 px
 - Loading and meshlet building run on a background thread (Lucy, 28M triangles: about 5s + 12s)
 
 ## Setup
@@ -36,8 +42,9 @@ cmake --build build
 ```bash
 ./build/meshlets                       # loads assets/model/metasphere.ply
 ./build/meshlets path/to/model.ply     # or -i/--input PATH
-./build/meshlets -a flex --max-vertices 128 --max-triangles 128 --min-triangles 64
-./build/meshlets -c shaded --matcap metal_carpaint --wireframe --wire-width 0.05
+./build/meshlets --no-lod -a flex --max-vertices 128 --max-triangles 128 --min-triangles 64
+./build/meshlets -c shaded --matcap metal_carpaint --wire-width 0.05
+./build/meshlets -c lod --lod-error 2   # color by LOD level (or --lod-level N for a fixed level)
 ./build/meshlets --help                # all options
 ```
 
