@@ -1,0 +1,54 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One task invocation per meshlet: frustum + normal cone culling, then emit
+// one mesh workgroup per surviving meshlet.
+layout(local_size_x = TASK_GROUP_SIZE) in;
+
+taskPayloadSharedEXT uint payloadMeshlets[TASK_GROUP_SIZE];
+
+shared uint visibleCount;
+
+bool isVisible(uint mi)
+{
+    Globals g = pc.globals;
+    Bounds b = pc.bounds.b[mi];
+    vec3 center = b.centerRadius.xyz;
+    float radius = b.centerRadius.w;
+
+    if ((g.flags & FLAG_FRUSTUM_CULL) != 0u)
+        for (int i = 0; i < 4; ++i)
+            if (dot(g.frustum[i].xyz, center) + g.frustum[i].w < -radius)
+                return false;
+
+    if ((g.flags & FLAG_CONE_CULL) != 0u)
+    {
+        // meshoptimizer: reject when the whole cluster faces away from the camera
+        vec3 toCenter = center - g.cameraPos.xyz;
+        if (dot(toCenter, b.coneAxisCutoff.xyz) >= b.coneAxisCutoff.w * length(toCenter) + radius)
+            return false;
+    }
+    return true;
+}
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0)
+        visibleCount = 0;
+    barrier();
+
+    uint mi = gl_GlobalInvocationID.x;
+    if (mi < pc.globals.meshletCount && isVisible(mi))
+    {
+        uint slot = atomicAdd(visibleCount, 1u);
+        payloadMeshlets[slot] = mi;
+    }
+    barrier();
+
+    if (gl_LocalInvocationIndex == 0 && pc.pass == 0u && visibleCount > 0u)
+        atomicAdd(pc.stats.visibleMeshlets, visibleCount);
+
+    EmitMeshTasksEXT(visibleCount, 1, 1);
+}

@@ -1,0 +1,2 @@
+assets/*.ply filter=lfs diff=lfs merge=lfs -text
+assets/*.obj filter=lfs diff=lfs merge=lfs -text
