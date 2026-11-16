@@ -12,6 +12,7 @@ layout(location = 0) out vec3 outNormal[];
 layout(location = 1) out vec3 outWorldPos[];
 layout(location = 2) perprimitiveEXT flat out uint outMeshletTriangle[];
 layout(location = 3) perprimitiveEXT flat out vec3 outAltitudes[];
+layout(location = 4) perprimitiveEXT flat out uint outEdgeMask[];
 
 shared vec3 sharedPositions[MAX_MESHLET_VERTICES];
 
@@ -47,6 +48,8 @@ void main()
         gl_PrimitiveTriangleIndicesEXT[t] = tri;
         outMeshletTriangle[t] = (mi << TRI_BITS) | t;
         outAltitudes[t] = triangleAltitudes(sharedPositions[tri.x], sharedPositions[tri.y], sharedPositions[tri.z]);
+        uint maskIndex = m.triangleOffset / 3u + t;
+        outEdgeMask[t] = (pc.edgeMasks.d[maskIndex >> 2] >> ((maskIndex & 3u) * 8u)) & 7u;
     }
 
 }

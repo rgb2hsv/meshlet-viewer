@@ -10,6 +10,7 @@ layout(location = 1) out vec3 outWorldPos;
 layout(location = 2) flat out uint outMeshletTriangle;
 layout(location = 3) flat out vec3 outAltitudes;
 layout(location = 4) out vec3 outBarycentric;
+layout(location = 5) flat out uint outEdgeMask;
 
 vec3 position(uint corner)
 {
@@ -29,6 +30,8 @@ void main()
     outWorldPos = p;
     outMeshletTriangle = pc.fallbackTriangles.d[gl_VertexIndex / 3];
     outBarycentric = vec3(corner == 0u, corner == 1u, corner == 2u);
+    uint triangle = uint(gl_VertexIndex) / 3u; // fallback: edge masks are stored per drawn triangle
+    outEdgeMask = (pc.edgeMasks.d[triangle >> 2] >> ((triangle & 3u) * 8u)) & 7u;
     outAltitudes = (pc.globals.flags & FLAG_WIREFRAME) != 0u
         ? triangleAltitudes(position(first), position(first + 1u), position(first + 2u))
         : vec3(0.0);

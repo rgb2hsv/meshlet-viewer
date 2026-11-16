@@ -1,0 +1,69 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// One BVH depth of automatic LOD selection (one dispatch per depth, roots at depth 0).
+// A node whose projected error is at or below the threshold has only groups whose coarser
+// version is detailed enough, so the subtree is skipped; so are subtrees outside the frustum.
+// Internal nodes queue their children for the next depth; a leaf (one group, which passed the
+// same coarse-error test as the brute-force rule) emits the group's clusters whose own error
+// is at or below the threshold. The candidates are then culled per cluster by the task shader.
+layout(local_size_x = BVH_GROUP_SIZE) in;
+
+void main()
+{
+    Globals g = pc.globals;
+    TraversalBuffer state = g.traversal;
+    const uint depth = pc.traversalDepth;
+
+    uint inputCount = depth == 0u ? g.lodRootCount : state.queueCount[depth - 1u];
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= inputCount)
+        return;
+
+    uint nodeIndex = depth == 0u ? index : ((depth - 1u) & 1u) == 0u ? g.queue0.d[index] : g.queue1.d[index];
+    LodNode node = g.lodNodes.n[nodeIndex];
+    atomicAdd(state.nodesVisited, 1u);
+
+    if ((g.flags & FLAG_FRUSTUM_CULL) != 0u && outsideFrustum(g, node.sphere.xyz, node.sphere.w))
+        return;
+
+    if (node.error < TERMINAL_ERROR)
+    {
+        float error = projectedError(g, node.sphere, node.error);
+        // leaves use the exact group test; internal nodes prune only with a safety margin
+        float margin = node.group >= 0 ? 1.0 : BVH_PRUNE_MARGIN;
+        if (error * margin <= g.lodThreshold)
+            return;
+    }
+
+    if (node.group < 0)
+    {
+        if (depth + 1u >= MAX_BVH_DEPTH)
+            return;
+        uint base = atomicAdd(state.queueCount[depth], node.childCount);
+        RwUintBuffer next = (depth & 1u) == 0u ? g.queue0 : g.queue1;
+        for (uint k = 0u; k < node.childCount; ++k)
+            next.d[base + k] = node.childOffset + k;
+        return;
+    }
+
+    uvec2 range = g.lodGroups.g[node.group];
+    uint selected = 0u;
+    for (uint c = range.x; c < range.x + range.y; ++c)
+    {
+        MeshletLod lod = pc.lods.l[c];
+        if (lod.selfError == 0.0 || projectedError(g, lod.selfSphere, lod.selfError) <= g.lodThreshold)
+            selected++;
+    }
+    if (selected == 0u)
+        return;
+
+    uint base = atomicAdd(state.candidateCount, selected);
+    for (uint c = range.x; c < range.x + range.y; ++c)
+    {
+        MeshletLod lod = pc.lods.l[c];
+        if (lod.selfError == 0.0 || projectedError(g, lod.selfSphere, lod.selfError) <= g.lodThreshold)
+            g.candidates.d[base++] = c;
+    }
+}

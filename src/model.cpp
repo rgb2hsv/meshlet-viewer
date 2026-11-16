@@ -648,6 +648,7 @@ bool buildLodClusters(const Model& model, const MeshletSettings& s, size_t maxVe
     clodBuild(config, mesh, [&](clodGroup group, const clodCluster* clusters, size_t clusterCount) -> int {
         const int groupIndex = int(groups.size());
         groups.push_back(group);
+        out.lodGroups.push_back({uint32_t(out.meshlets.size()), uint32_t(clusterCount)});
 
         for (size_t i = 0; i < clusterCount; ++i)
         {
@@ -686,6 +687,47 @@ bool buildLodClusters(const Model& model, const MeshletSettings& s, size_t maxVe
         return false;
     }
     out.triangles.resize((out.triangles.size() + 3) & ~size_t(3));
+
+    // BVH over the groups for GPU LOD selection: a forest with one 8-wide tree per DAG level
+    const size_t nodeWidth = 8;
+    int maxDepth = 0;
+    for (const clodGroup& group : groups)
+        maxDepth = std::max(maxDepth, group.depth);
+    const size_t levelCount = size_t(maxDepth) + 1;
+
+    std::vector<clodNode> nodes(clodBuildHierarchyBound(groups.size(), nodeWidth, levelCount));
+    nodes.resize(clodBuildHierarchy(nodes.data(), groups.data(), groups.size(), nodeWidth, levelCount));
+
+    out.lodNodes.resize(nodes.size());
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        const clodNode& n = nodes[i];
+        LodNode& g = out.lodNodes[i];
+        std::memcpy(g.center, n.bounds.center, sizeof(g.center));
+        g.radius = n.bounds.radius;
+        g.error = n.bounds.error;
+        g.group = n.group;
+        g.childOffset = n.group < 0 ? n.child_offset : 0;
+        g.childCount = n.group < 0 ? n.child_count : 0;
+    }
+    out.lodRootCount = uint32_t(levelCount);
+
+    // count nodes per tree depth (breadth-first from the roots); the GPU traverses one depth per pass
+    std::vector<uint32_t> frontier, next;
+    for (uint32_t root = 0; root < out.lodRootCount; ++root)
+        frontier.push_back(root);
+    while (!frontier.empty())
+    {
+        out.lodNodesPerDepth.push_back(uint32_t(frontier.size()));
+        next.clear();
+        for (uint32_t index : frontier)
+        {
+            const LodNode& n = out.lodNodes[index];
+            for (uint32_t k = 0; k < n.childCount; ++k)
+                next.push_back(n.childOffset + k);
+        }
+        frontier.swap(next);
+    }
     return true;
 }
 
@@ -791,12 +833,37 @@ bool buildMeshlets(const Model& model, const MeshletSettings& s, MeshletData& ou
     const bool optimizeHere = s.optimize && !s.lod; // clodBuild already optimized its clusters
 
     out.bounds.resize(count);
+    out.edgeMasks.assign(((out.triangles.size() + 2) / 3 + 3) & ~size_t(3), 0);
     parallelFor(count, [&](size_t begin, size_t end) {
+        std::vector<uint32_t> edges; // (min << 8 | max) local vertex pairs
         for (size_t i = begin; i < end; ++i)
         {
             const meshopt_Meshlet& m = out.meshlets[i];
             if (optimizeHere)
                 meshopt_optimizeMeshlet(&out.vertices[m.vertex_offset], &out.triangles[m.triangle_offset], m.triangle_count, m.vertex_count);
+
+            // perimeter edges: local edges used by exactly one triangle of this meshlet
+            const uint8_t* tri = &out.triangles[m.triangle_offset];
+            edges.clear();
+            for (uint32_t t = 0; t < m.triangle_count * 3; t += 3)
+                for (uint32_t k = 0; k < 3; ++k)
+                {
+                    uint32_t a = tri[t + (k + 1) % 3], b = tri[t + (k + 2) % 3];
+                    edges.push_back(std::min(a, b) << 8 | std::max(a, b));
+                }
+            std::vector<uint32_t> sorted = edges;
+            std::sort(sorted.begin(), sorted.end());
+            for (uint32_t t = 0; t < m.triangle_count; ++t)
+            {
+                uint8_t mask = 0;
+                for (uint32_t k = 0; k < 3; ++k)
+                {
+                    auto range = std::equal_range(sorted.begin(), sorted.end(), edges[t * 3 + k]);
+                    if (range.second - range.first == 1)
+                        mask |= uint8_t(1u << k); // edge opposite local vertex k
+                }
+                out.edgeMasks[m.triangle_offset / 3 + t] = mask;
+            }
 
             meshopt_Bounds b = meshopt_computeMeshletBounds(&out.vertices[m.vertex_offset], &out.triangles[m.triangle_offset],
                 m.triangle_count, positions, vertexCount, stride);

@@ -11,22 +11,22 @@ enum class ColorMode : uint32_t
     Triangle = 1,
     Normal = 2,
     Shaded = 3,
-    LodLevel = 4,
 };
 
 constexpr uint32_t kMaxLodLevels = 32; // MAX_LOD_LEVELS in shaders/common.glsl
 
 struct DrawParams
 {
-    mat4 viewProj;
-    vec3 cameraPos;
-    vec3 lightDir = {0, 0, 1}; // world space, towards the light
-    vec3 viewRight, viewUp, viewBack; // camera basis (world space), for matcap lookups
+    Eigen::Matrix4f viewProj = Eigen::Matrix4f::Identity();
+    Eigen::Vector3f cameraPos = Eigen::Vector3f::Zero();
+    Eigen::Vector3f lightDir = Eigen::Vector3f::UnitZ(); // world space, towards the light
+    // camera basis (world space), for matcap lookups
+    Eigen::Vector3f viewRight = Eigen::Vector3f::UnitX(), viewUp = Eigen::Vector3f::UnitY(), viewBack = Eigen::Vector3f::UnitZ();
     int matcap = -1;                  // index into the loaded matcaps; -1 = plain lighting
 
     // LOD selection and culling use their own camera so they can be frozen while orbiting
-    mat4 cullViewProj;
-    vec3 cullCameraPos;
+    Eigen::Matrix4f cullViewProj = Eigen::Matrix4f::Identity();
+    Eigen::Vector3f cullCameraPos = Eigen::Vector3f::Zero();
     bool lodAuto = true;       // true: pixel error threshold; false: fixed DAG level
     float lodThreshold = 1.f;  // pixels
     int lodLevel = 0;
@@ -37,8 +37,10 @@ struct DrawParams
     bool frustumCull = true;
     bool coneCull = true;
     bool wireframe = false;
-    float wireWidth = 0.f; // line width in model units
+    float wireWidth = 0.f;    // triangle wireframe line width in model units (0 = off)
+    float outlineWidth = 0.f; // meshlet outline width in model units (0 = off)
     float clearColor[3] = {0.08f, 0.09f, 0.11f};
+    float viewportX = 0.f; // left edge of the 3D view in framebuffer pixels (right of the sidebar)
 };
 
 struct FrameStats
@@ -48,6 +50,9 @@ struct FrameStats
     double gpuMs = 0;
     uint32_t levelClusters[kMaxLodLevels] = {};
     uint32_t levelTriangles[kMaxLodLevels] = {};
+    bool bvh = false;           // automatic LOD selected through the BVH this frame
+    uint32_t bvhNodesVisited = 0;
+    uint32_t bvhCandidates = 0; // clusters the BVH selected (before frustum/cone culling)
     bool valid = false;
 };
 
@@ -65,6 +70,7 @@ public:
     bool usesMeshShaders() const { return meshPipeline != VK_NULL_HANDLE; }
     // Cluster LOD selection runs in the task shader; the vertex fallback draws level 0 only.
     bool supportsLod() const { return usesMeshShaders(); }
+    bool hasLodBvh() const { return lodNodes.buffer != VK_NULL_HANDLE; }
     // The vertex path passes barycentrics itself; the mesh path needs VK_KHR_fragment_shader_barycentric.
     bool supportsWireframe() const { return !usesMeshShaders() || ctx->caps.barycentric; }
     size_t gpuBytes() const { return sceneBytes; }
@@ -90,6 +96,11 @@ private:
         Buffer globals;
         Buffer stats;
         bool submitted = false;
+        bool usedBvh = false;
+        // BVH traversal (sized with the scene)
+        Buffer traversal; // host-visible counters + indirect mesh-task command
+        Buffer candidates;
+        Buffer queues[2];
     };
 
     void begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t imageIndex, const DrawParams& params);
@@ -101,6 +112,8 @@ private:
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline meshPipeline = VK_NULL_HANDLE;
     VkPipeline vertexPipeline = VK_NULL_HANDLE;
+    VkPipeline traversePipeline = VK_NULL_HANDLE; // lod_traverse.comp
+    VkPipeline finalizePipeline = VK_NULL_HANDLE; // lod_finalize.comp
     VkQueryPool timestamps = VK_NULL_HANDLE;
 
     // matcap textures, bound as one sampler2D array (descriptor set 0, binding 0)
@@ -116,6 +129,11 @@ private:
 
     Buffer vertices, meshlets, meshletVertices, meshletTriangles, bounds;
     Buffer lods;
+    Buffer edgeMasks;      // meshlet perimeter edges per triangle
+    uint32_t lodLevelCount = 1;
+    Buffer lodNodes, lodGroups;              // BVH (cluster LOD builds only)
+    uint32_t lodRootCount = 0;
+    std::vector<uint32_t> lodNodesPerDepth;
     Buffer fallbackIndices, fallbackTriangles;
     uint32_t fallbackClusters = 0;  // fallback draws level 0 only
     uint32_t fallbackTriangleCount = 0;

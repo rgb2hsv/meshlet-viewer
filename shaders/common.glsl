@@ -13,16 +13,21 @@
 #define FLAG_FRUSTUM_CULL 1u
 #define FLAG_CONE_CULL 2u
 #define FLAG_WIREFRAME 4u
+#define FLAG_LOD_CANDIDATES 8u // task shader reads the BVH-selected cluster list instead of all clusters
 
 #define MODE_MESHLET 0u
 #define MODE_TRIANGLE 1u
 #define MODE_NORMAL 2u
 #define MODE_SHADED 3u
-#define MODE_LOD 4u
 
 #define LOD_AUTO 0u  // screen-space error threshold
 #define LOD_FIXED 1u // one DAG level (plus terminal clusters below it)
 #define MAX_LOD_LEVELS 32u
+#define MAX_BVH_DEPTH 64u
+#define BVH_GROUP_SIZE 64
+// internal BVH nodes are pruned only with this relative margin, so float rounding in the merged
+// spheres can never prune a group whose own (exact) test would select it
+#define BVH_PRUNE_MARGIN 1.001
 #define TERMINAL_ERROR 3.0e38 // clusters with nothing coarser store FLT_MAX
 
 struct Vertex
@@ -61,6 +66,29 @@ struct MeshletLod
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer LodBuffer { MeshletLod l[]; };
 
+struct LodNode
+{
+    vec4 sphere;      // conservative bounds of the subtree's group error spheres
+    float error;      // max error in the subtree; FLT_MAX if it contains a terminal group
+    int group;        // leaf: group index; internal: -1
+    uint childOffset;
+    uint childCount;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer LodNodeBuffer { LodNode n[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer LodGroupBuffer { uvec2 g[]; }; // first cluster, count
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer RwUintBuffer { uint d[]; };
+
+// Per-frame traversal state; zeroed before the passes
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer TraversalBuffer
+{
+    uint dispatchX, dispatchY, dispatchZ; // VkDrawMeshTasksIndirectCommandEXT for the task shader
+    uint candidateCount;
+    uint nodesVisited;
+    uint pad0, pad1, pad2;
+    uint queueCount[MAX_BVH_DEPTH]; // nodes queued for each BVH depth
+};
+
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer StatsBuffer
 {
     uint visibleMeshlets;
@@ -79,9 +107,10 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Gl
     uint mode;
     int highlight;    // -1 = none
     uint flags;
-    float wireWidth;  // wireframe line width in model units
-    int matcap;       // index into matcaps[], -1 = plain lighting
-    float pad0, pad1;
+    float wireWidth;    // triangle wireframe line width in model units (0 = off)
+    int matcap;         // index into matcaps[], -1 = plain lighting
+    float outlineWidth; // meshlet perimeter outline width in model units (0 = off)
+    float pad1;
     vec4 viewRight;   // camera basis in world space (view-space x, y, z)
     vec4 viewUp;
     vec4 viewBack;
@@ -90,6 +119,17 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Gl
     float lodThreshold; // pixels
     uint lodMode;     // LOD_AUTO or LOD_FIXED
     uint lodLevel;    // LOD_FIXED level
+
+    // BVH LOD selection (LOD_AUTO with a hierarchy)
+    LodNodeBuffer lodNodes;
+    LodGroupBuffer lodGroups;
+    TraversalBuffer traversal;
+    RwUintBuffer candidates; // selected cluster indices
+    RwUintBuffer queue0;     // node queues, ping-pong by depth
+    RwUintBuffer queue1;
+    uint lodRootCount;       // roots are nodes[0, lodRootCount)
+    uint lodLevelCount;      // DAG levels, for the meshlet color gradient
+    uint pad4, pad5;
 };
 
 layout(push_constant) uniform PushConstants
@@ -104,7 +144,29 @@ layout(push_constant) uniform PushConstants
     UintBuffer fallbackTriangles; // vertex path: packed meshlet/triangle id per triangle
     StatsBuffer stats;
     LodBuffer lods;
+    UintBuffer edgeMasks;  // per triangle, bytes: meshlet perimeter edges (bit i: edge opposite vertex i)
+    uint traversalDepth; // lod_traverse.comp: BVH depth processed by this dispatch
 } pc;
+
+// Projected simplification error in pixels (meshoptimizer clusterlod.h convention:
+// rotation-invariant, distance to the closest point of the error sphere).
+// `precise` keeps the arithmetic identical at every call site, so a group's coarse test and its
+// replacement clusters' own test always agree exactly (no cracks or overlaps in the cut).
+float projectedError(Globals g, vec4 sphere, float error)
+{
+    precise vec3 d = sphere.xyz - g.lodCamera.xyz;
+    precise float distance = max(sqrt(dot(d, d)) - sphere.w, g.lodCamera.w);
+    precise float result = error / distance * g.lodScale;
+    return result;
+}
+
+bool outsideFrustum(Globals g, vec3 center, float radius)
+{
+    for (int i = 0; i < 4; ++i)
+        if (dot(g.frustum[i].xyz, center) + g.frustum[i].w < -radius)
+            return true;
+    return false;
+}
 
 // Altitudes of triangle (a, b, c): distance from each vertex to its opposite edge.
 // barycentric[i] * altitude[i] is then the in-plane distance to edge i, in model units.

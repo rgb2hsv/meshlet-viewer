@@ -3,24 +3,16 @@
 #extension GL_GOOGLE_include_directive : require
 #include "common.glsl"
 
-// One task invocation per cluster (all LOD levels): pick the clusters of the
-// current LOD cut, cull them against the frustum and normal cone, then emit
-// one mesh workgroup per surviving cluster.
+// One task invocation per cluster: either per candidate selected by the BVH traversal
+// (lod_traverse.comp, automatic LOD) or per cluster of all levels with the LOD test done
+// here (fixed level / no hierarchy). Survivors of frustum + normal cone culling get one
+// mesh workgroup each.
 layout(local_size_x = TASK_GROUP_SIZE) in;
 
 taskPayloadSharedEXT uint payloadMeshlets[TASK_GROUP_SIZE];
 
 shared uint visibleCount;
 shared uint visibleTriangles;
-
-// Projected simplification error in pixels (meshoptimizer clusterlod.h convention:
-// rotation-invariant, distance to the closest point of the error sphere).
-float projectedError(vec4 sphere, float error)
-{
-    Globals g = pc.globals;
-    float distance = max(length(sphere.xyz - g.lodCamera.xyz) - sphere.w, g.lodCamera.w);
-    return error / distance * g.lodScale;
-}
 
 bool isSelected(MeshletLod lod)
 {
@@ -30,8 +22,8 @@ bool isSelected(MeshletLod lod)
         return lod.level == g.lodLevel || (lod.level < g.lodLevel && terminal);
 
     // draw when the coarser version would be too coarse and this one is detailed enough
-    bool coarseTooCoarse = terminal || projectedError(lod.coarseSphere, lod.coarseError) > g.lodThreshold;
-    bool selfFineEnough = lod.selfError == 0.0 || projectedError(lod.selfSphere, lod.selfError) <= g.lodThreshold;
+    bool coarseTooCoarse = terminal || projectedError(g, lod.coarseSphere, lod.coarseError) > g.lodThreshold;
+    bool selfFineEnough = lod.selfError == 0.0 || projectedError(g, lod.selfSphere, lod.selfError) <= g.lodThreshold;
     return coarseTooCoarse && selfFineEnough;
 }
 
@@ -42,10 +34,8 @@ bool isVisible(uint mi)
     vec3 center = b.centerRadius.xyz;
     float radius = b.centerRadius.w;
 
-    if ((g.flags & FLAG_FRUSTUM_CULL) != 0u)
-        for (int i = 0; i < 4; ++i)
-            if (dot(g.frustum[i].xyz, center) + g.frustum[i].w < -radius)
-                return false;
+    if ((g.flags & FLAG_FRUSTUM_CULL) != 0u && outsideFrustum(g, center, radius))
+        return false;
 
     if ((g.flags & FLAG_CONE_CULL) != 0u)
     {
@@ -66,11 +56,16 @@ void main()
     }
     barrier();
 
-    uint mi = gl_GlobalInvocationID.x;
-    if (mi < pc.globals.meshletCount)
+    Globals g = pc.globals;
+    const bool useCandidates = (g.flags & FLAG_LOD_CANDIDATES) != 0u;
+    uint count = useCandidates ? g.traversal.candidateCount : g.meshletCount;
+
+    uint index = gl_GlobalInvocationID.x;
+    if (index < count)
     {
+        uint mi = useCandidates ? g.candidates.d[index] : index;
         MeshletLod lod = pc.lods.l[mi];
-        if (isSelected(lod) && isVisible(mi))
+        if ((useCandidates || isSelected(lod)) && isVisible(mi))
         {
             uint slot = atomicAdd(visibleCount, 1u);
             payloadMeshlets[slot] = mi;

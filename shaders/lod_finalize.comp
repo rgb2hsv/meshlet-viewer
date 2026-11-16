@@ -1,0 +1,14 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+
+// Turns the candidate count from lod_traverse.comp into the indirect mesh-task dispatch.
+layout(local_size_x = 1) in;
+
+void main()
+{
+    TraversalBuffer state = pc.globals.traversal;
+    state.dispatchX = (state.candidateCount + uint(TASK_GROUP_SIZE) - 1u) / uint(TASK_GROUP_SIZE);
+    state.dispatchY = 1u;
+    state.dispatchZ = 1u;
+}

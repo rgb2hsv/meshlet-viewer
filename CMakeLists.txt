@@ -101,6 +101,8 @@ compile_shader(meshlet.vert vert kMeshletVertSpv)
 compile_shader(meshlet.frag frag kMeshletFragMeshSpv       MESH_PIPELINE=1 BARYCENTRIC=1)
 compile_shader(meshlet.frag frag kMeshletFragMeshNoBarySpv MESH_PIPELINE=1 BARYCENTRIC=0)
 compile_shader(meshlet.frag frag kMeshletFragVertSpv       MESH_PIPELINE=0 BARYCENTRIC=0)
+compile_shader(lod_traverse.comp comp kLodTraverseSpv)
+compile_shader(lod_finalize.comp comp kLodFinalizeSpv)
 
 add_custom_target(shaders DEPENDS ${SHADER_HEADERS})
 
@@ -116,7 +118,8 @@ add_executable(meshlets
 add_dependencies(meshlets shaders)
 target_compile_definitions(meshlets PRIVATE MESHLETS_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
 target_include_directories(meshlets PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${SHADER_OUT_DIR})
-target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/stb) # stb_image (matcap PNGs)
+target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/stb)   # stb_image (matcap PNGs)
+target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/eigen) # Eigen (header-only vector math)
 target_link_libraries(meshlets PRIVATE meshoptimizer argparse::argparse imgui::imgui glfw volk::volk Threads::Threads)
 
 if(MSVC)

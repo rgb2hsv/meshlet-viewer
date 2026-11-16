@@ -58,7 +58,7 @@ std::string fileName(const std::string& path)
 // --------------------------------------------------------------------------
 struct Camera
 {
-    vec3 target;
+    Eigen::Vector3f target = Eigen::Vector3f::Zero();
     float distance = 1.f;
     float yaw = 0.6f;
     float pitch = 0.3f;
@@ -66,45 +66,46 @@ struct Camera
     float fovY = 0.8f;
     bool zUp = false;
 
-    vec3 up() const { return zUp ? vec3{0, 0, 1} : vec3{0, 1, 0}; }
+    Eigen::Vector3f up() const { return zUp ? Eigen::Vector3f::UnitZ() : Eigen::Vector3f::UnitY(); }
 
-    vec3 eye() const
+    Eigen::Vector3f eye() const
     {
         float cp = std::cos(pitch), sp = std::sin(pitch);
-        vec3 dir = zUp ? vec3{cp * std::cos(yaw), cp * std::sin(yaw), sp} : vec3{cp * std::sin(yaw), sp, cp * std::cos(yaw)};
+        Eigen::Vector3f dir = zUp ? Eigen::Vector3f(cp * std::cos(yaw), cp * std::sin(yaw), sp)
+                                  : Eigen::Vector3f(cp * std::sin(yaw), sp, cp * std::cos(yaw));
         return target + dir * distance;
     }
 
-    void basis(vec3& right, vec3& camUp, vec3& back) const
+    void basis(Eigen::Vector3f& right, Eigen::Vector3f& camUp, Eigen::Vector3f& back) const
     {
-        vec3 forward = normalize(target - eye());
-        right = normalize(cross(forward, up()));
-        camUp = cross(right, forward);
+        Eigen::Vector3f forward = (target - eye()).normalized();
+        right = forward.cross(up()).normalized();
+        camUp = right.cross(forward);
         back = forward * -1.f;
     }
 
     // Light from the upper left, slightly behind the viewer
-    vec3 lightDir() const
+    Eigen::Vector3f lightDir() const
     {
-        vec3 forward = normalize(target - eye());
-        vec3 right = normalize(cross(forward, up()));
-        vec3 camUp = cross(right, forward);
-        return normalize(forward * -0.6f + right * -0.5f + camUp * 0.7f);
+        Eigen::Vector3f forward = (target - eye()).normalized();
+        Eigen::Vector3f right = forward.cross(up()).normalized();
+        Eigen::Vector3f camUp = right.cross(forward);
+        return (forward * -0.6f + right * -0.5f + camUp * 0.7f).normalized();
     }
 
     void frame(const Model& model)
     {
-        vec3 lo = {model.boundsMin[0], model.boundsMin[1], model.boundsMin[2]};
-        vec3 hi = {model.boundsMax[0], model.boundsMax[1], model.boundsMax[2]};
+        const Eigen::Vector3f lo(model.boundsMin[0], model.boundsMin[1], model.boundsMin[2]);
+        const Eigen::Vector3f hi(model.boundsMax[0], model.boundsMax[1], model.boundsMax[2]);
         target = (lo + hi) * 0.5f;
-        radius = std::max(length(hi - lo) * 0.5f, 1e-6f);
+        radius = std::max((hi - lo).norm() * 0.5f, 1e-6f);
         distance = radius / std::sin(fovY * 0.5f) * 1.05f;
     }
 
     float zNear() const { return radius * 0.0005f; }
     float projScale() const { return 1.f / std::tan(fovY * 0.5f); } // cot(fovY / 2)
 
-    mat4 viewProj(float aspect) const
+    Eigen::Matrix4f viewProj(float aspect) const
     {
         return perspectiveReverseZ(fovY, aspect, zNear()) * lookAt(eye(), target, up());
     }
@@ -121,9 +122,9 @@ struct Camera
         }
         if (ImGui::IsMouseDown(ImGuiMouseButton_Middle) || (ImGui::IsMouseDown(ImGuiMouseButton_Left) && io.KeyShift))
         {
-            vec3 forward = normalize(target - eye());
-            vec3 right = normalize(cross(forward, up()));
-            vec3 camUp = cross(right, forward);
+            Eigen::Vector3f forward = (target - eye()).normalized();
+            Eigen::Vector3f right = forward.cross(up()).normalized();
+            Eigen::Vector3f camUp = right.cross(forward);
             float scale = distance * 0.0015f;
             target = target - right * (dx * scale) + camUp * (dy * scale);
         }
@@ -158,8 +159,10 @@ struct App
     bool autoRebuild = true;
     bool rebuildPending = false;
     float initialZoom = 1.f;
-    float wireWidthOverride = 0.f; // from --wire-width; 0 = automatic
-    static constexpr float kAutoWireFraction = 0.1f; // default width = 10% of the average edge
+    float wireWidthOverride = 0.f;    // from --wire-width; 0 = automatic
+    float outlineWidthOverride = 0.f; // from --outline-width; 0 = automatic
+    static constexpr float kAutoWireFraction = 0.05f;    // triangle lines: 5% of the average edge
+    static constexpr float kAutoOutlineFraction = 0.25f; // meshlet outlines: 25% of the average edge
     bool firstLoad = true;
     bool loadFailed = false; // a load failed and no model is available
 
@@ -174,9 +177,13 @@ struct App
     DrawParams draw;
     std::vector<ImTextureID> matcapTextures; // ImGui handles for the selector thumbnails
 
+    static constexpr float kSidebarDefaultWidth = 400.f;
+    static constexpr float kSidebarMinWidth = 300.f;
+    float sidebarWidth = kSidebarDefaultWidth; // logical pixels; the 3D view renders to its right
+
     bool freezeLod = false; // LOD selection + culling use a snapshot of the camera
-    mat4 frozenViewProj;
-    vec3 frozenEye;
+    Eigen::Matrix4f frozenViewProj = Eigen::Matrix4f::Identity();
+    Eigen::Vector3f frozenEye = Eigen::Vector3f::Zero();
     FrameStats stats;
 
     bool busy() const { return job.valid(); }
@@ -248,6 +255,8 @@ struct App
                 camera.frame(*model);
                 camera.distance /= initialZoom;
                 draw.wireWidth = firstLoad && wireWidthOverride > 0.f ? wireWidthOverride : model->avgEdgeLength * kAutoWireFraction;
+                draw.outlineWidth =
+                    firstLoad && outlineWidthOverride > 0.f ? outlineWidthOverride : model->avgEdgeLength * kAutoOutlineFraction;
                 freezeLod = false;
                 if (!firstLoad)
                     draw.highlight = -1; // keep --highlight for the first model
@@ -308,12 +317,32 @@ void App::ui()
 {
     const ImGuiIO& io = ImGui::GetIO();
 
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(380, 0), ImVec2(380, FLT_MAX));
-    ImGui::Begin("Meshlets", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    // Left sidebar: docked, full height, scrolls vertically; the right edge can be dragged to resize
+    const float height = io.DisplaySize.y;
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(kSidebarDefaultWidth, height), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(kSidebarMinWidth, height), ImVec2(std::max(kSidebarMinWidth, io.DisplaySize.x * 0.6f), height));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
+    ImGui::Begin("Meshlets", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus |
+            ImGuiWindowFlags_NoSavedSettings);
+    ImGui::PopStyleVar(2);
+    sidebarWidth = ImGui::GetWindowWidth();
+
+    // sections are always open (no collapsing headers)
+    auto section = [](const char* title) {
+        ImGui::Spacing();
+        ImGui::SeparatorText(title);
+        return true;
+    };
+
+    ImGui::TextUnformatted("Meshlets");
+    ImGui::SameLine();
+    ImGui::TextDisabled("meshoptimizer + Vulkan mesh shaders");
 
     // ---- Model ----
-    if (ImGui::CollapsingHeader("Model", ImGuiTreeNodeFlags_DefaultOpen))
+    if (section("Model"))
     {
         ImGui::SetNextItemWidth(-60);
         bool enter = ImGui::InputTextWithHint("##path", "path/to/model.ply", pathInput, sizeof(pathInput), ImGuiInputTextFlags_EnterReturnsTrue);
@@ -339,7 +368,7 @@ void App::ui()
     }
 
     // ---- Meshlet builder ----
-    if (ImGui::CollapsingHeader("Meshlet builder", ImGuiTreeNodeFlags_DefaultOpen))
+    if (section("Meshlet builder"))
     {
         bool changed = false;
         changed |= ImGui::Checkbox("Build LOD hierarchy", &settings.lod);
@@ -449,7 +478,7 @@ void App::ui()
     }
 
     // ---- Level of detail ----
-    if (meshlets && meshlets->lod && ImGui::CollapsingHeader("Level of detail", ImGuiTreeNodeFlags_DefaultOpen))
+    if (meshlets && meshlets->lod && section("Level of detail"))
     {
         const MeshletData& m = *meshlets;
         const int levels = int(m.levelClusters.size());
@@ -512,16 +541,21 @@ void App::ui()
             ImGui::EndTable();
         }
         ImGui::TextDisabled("Coarsest cut: %s triangles", formatCount(m.coarsestTriangles).c_str());
+        if (stats.valid && stats.bvh)
+            ImGui::TextDisabled("BVH: %s of %s nodes tested -> %s candidate clusters", formatCount(stats.bvhNodesVisited).c_str(),
+                formatCount(m.lodNodes.size()).c_str(), formatCount(stats.bvhCandidates).c_str());
+        else if (stats.valid && renderer.supportsLod())
+            ImGui::TextDisabled("Selection: all %s clusters tested in the task shader", formatCount(m.meshlets.size()).c_str());
     }
 
     // ---- Rendering ----
-    if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen))
+    if (section("Rendering"))
     {
         ImGui::TextDisabled("%s", ctx.caps.props.deviceName);
         ImGui::TextDisabled("%s", renderer.usesMeshShaders() ? "Pipeline: task + mesh shaders (VK_EXT_mesh_shader)"
                                                              : "Pipeline: vertex shader fallback (no culling)");
 
-        const char* modes[] = {"Meshlet", "Triangle", "Normal", "Shaded", "LOD level"};
+        const char* modes[] = {"Meshlet (LOD gradient)", "Triangle", "Normal", "Shaded"};
         int mode = int(draw.mode);
         if (ImGui::Combo("Color", &mode, modes, IM_ARRAYSIZE(modes)))
             draw.mode = ColorMode(mode);
@@ -568,18 +602,22 @@ void App::ui()
         }
 
         ImGui::BeginDisabled(!renderer.supportsWireframe());
-        ImGui::Checkbox("Wireframe", &draw.wireframe);
+        ImGui::Checkbox("Outlines + wireframe", &draw.wireframe);
         if (!renderer.supportsWireframe() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("needs VK_KHR_fragment_shader_barycentric");
         ImGui::EndDisabled();
         if (draw.wireframe && model)
         {
-            // width is in model units; the slider range follows the mesh resolution
+            // widths are in model units; the slider range follows the mesh resolution (0 hides the lines)
             const float edge = std::max(model->avgEdgeLength, 1e-12f);
             ImGui::SetNextItemWidth(160);
-            ImGui::SliderFloat("Line width", &draw.wireWidth, edge * 0.005f, edge * 2.f, "%.3g units", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Meshlet outline", &draw.outlineWidth, 0.f, edge * 2.f, "%.3g units", ImGuiSliderFlags_Logarithmic);
             ImGui::SameLine();
-            ImGui::TextDisabled("(%.0f%% of avg edge)", 100.f * draw.wireWidth / edge);
+            ImGui::TextDisabled("(%.0f%% edge)", 100.f * draw.outlineWidth / edge);
+            ImGui::SetNextItemWidth(160);
+            ImGui::SliderFloat("Triangle lines", &draw.wireWidth, 0.f, edge * 2.f, "%.3g units", ImGuiSliderFlags_Logarithmic);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%.0f%% edge)", 100.f * draw.wireWidth / edge);
         }
 
         ImGui::BeginDisabled(!renderer.usesMeshShaders());
@@ -601,7 +639,7 @@ void App::ui()
     }
 
     // ---- Inspector ----
-    if (meshlets && ImGui::CollapsingHeader("Inspect meshlet"))
+    if (meshlets && section("Inspect meshlet"))
     {
         int count = int(meshlets->meshlets.size());
         ImGui::SliderInt("Highlight", &draw.highlight, -1, count - 1, draw.highlight < 0 ? "none" : "%d");
@@ -718,7 +756,8 @@ struct Options
     ColorMode colorMode = ColorMode::Meshlet;
     std::string matcap = "clay_studio"; // Blender matcap for --color shaded; "none" = plain lighting
     bool wireframe = true;
-    float wireWidth = 0.f; // model units; 0 = automatic
+    float wireWidth = 0.f;    // model units; 0 = automatic
+    float outlineWidth = 0.f; // model units; 0 = automatic
     bool frustumCull = true;
     bool coneCull = true;
     int highlight = -1;
@@ -773,10 +812,11 @@ bool parseOptions(int argc, char** argv, Options& opt)
 
     // ---- view ----
     program.add_group("View");
-    program.add_argument("-c", "--color").default_value(std::string("meshlet")).nargs(1).choices("meshlet", "triangle", "normal", "shaded", "lod").help("color mode");
+    program.add_argument("-c", "--color").default_value(std::string("meshlet")).nargs(1).choices("meshlet", "triangle", "normal", "shaded").help("color mode (meshlet: colored by LOD level)");
     program.add_argument("--matcap").metavar("NAME").default_value(std::string("clay_studio")).nargs(1).help("Blender matcap from assets/matcap for --color shaded (file name without .png, or none)");
-    program.add_argument("--no-wireframe").flag().help("hide the wireframe overlay");
-    program.add_argument("--wire-width").metavar("W").default_value(0.f).nargs(1).scan<'g', float>().help("wireframe line width in model units (0 = 10% of the average edge length)");
+    program.add_argument("--no-wireframe").flag().help("hide the meshlet outlines and triangle wireframe");
+    program.add_argument("--wire-width").metavar("W").default_value(0.f).nargs(1).scan<'g', float>().help("triangle wireframe line width in model units (0 = 5% of the average edge length)");
+    program.add_argument("--outline-width").metavar("W").default_value(0.f).nargs(1).scan<'g', float>().help("meshlet outline width in model units (0 = 25% of the average edge length)");
     program.add_argument("--no-frustum-cull").flag().help("disable task-shader frustum culling");
     program.add_argument("--no-cone-cull").flag().help("disable task-shader normal cone (backface) culling");
     program.add_argument("--highlight").metavar("INDEX").default_value(-1).nargs(1).scan<'i', int>().help("highlight one meshlet by index");
@@ -891,12 +931,14 @@ bool parseOptions(int argc, char** argv, Options& opt)
     opt.colorMode = color == "triangle" ? ColorMode::Triangle
                     : color == "normal" ? ColorMode::Normal
                     : color == "shaded" ? ColorMode::Shaded
-                    : color == "lod"    ? ColorMode::LodLevel
                                         : ColorMode::Meshlet;
     opt.wireframe = !program.get<bool>("--no-wireframe");
     opt.wireWidth = program.get<float>("--wire-width");
-    if (opt.wireWidth < 0.f)
-        return fail("--wire-width must be >= 0");
+    opt.outlineWidth = program.get<float>("--outline-width");
+    if (opt.wireWidth < 0.f || opt.outlineWidth < 0.f)
+        return fail("--wire-width and --outline-width must be >= 0");
+    if (program.is_used("--outline-width") && !opt.wireframe)
+        std::fprintf(stderr, "warning: --outline-width has no effect with --no-wireframe\n");
     if (program.is_used("--wire-width") && !opt.wireframe)
         std::fprintf(stderr, "warning: --wire-width has no effect with --no-wireframe\n");
     opt.frustumCull = !program.get<bool>("--no-frustum-cull");
@@ -995,6 +1037,7 @@ int main(int argc, char** argv)
     app->draw.mode = opt.colorMode;
     app->draw.wireframe = opt.wireframe;
     app->wireWidthOverride = opt.wireWidth;
+    app->outlineWidthOverride = opt.outlineWidth;
     if (opt.wireframe && !app->renderer.supportsWireframe())
         std::fprintf(stderr, "warning: wireframe needs VK_KHR_fragment_shader_barycentric on the mesh shader path\n");
     app->draw.frustumCull = opt.frustumCull;
@@ -1125,7 +1168,10 @@ int main(int argc, char** argv)
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
-        float aspect = float(ctx.swapchain.extent.width) / float(ctx.swapchain.extent.height);
+        // the 3D view occupies the area right of the sidebar
+        const float sidebarPixels = std::min(app->sidebarWidth * ImGui::GetIO().DisplayFramebufferScale.x, float(ctx.swapchain.extent.width) - 1.f);
+        app->draw.viewportX = sidebarPixels;
+        float aspect = (float(ctx.swapchain.extent.width) - sidebarPixels) / float(ctx.swapchain.extent.height);
         app->draw.viewProj = app->camera.viewProj(aspect);
         app->draw.cameraPos = app->camera.eye();
         app->draw.cullViewProj = app->freezeLod ? app->frozenViewProj : app->draw.viewProj;

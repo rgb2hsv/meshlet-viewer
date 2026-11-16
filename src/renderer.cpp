@@ -2,9 +2,13 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstddef>
+#include <cmath>
 #include <cstring>
 
 // SPIR-V generated at build time by glslang (see CMakeLists.txt)
+#include "kLodFinalizeSpv.h"
+#include "kLodTraverseSpv.h"
 #include "kMeshletFragMeshNoBarySpv.h"
 #include "kMeshletFragMeshSpv.h"
 #include "kMeshletFragVertSpv.h"
@@ -30,7 +34,8 @@ struct GpuGlobals
     uint32_t flags;
     float wireWidth;
     int32_t matcap;
-    float pad[2];
+    float outlineWidth;
+    float pad;
     float viewRight[4];
     float viewUp[4];
     float viewBack[4];
@@ -39,8 +44,32 @@ struct GpuGlobals
     float lodThreshold;
     uint32_t lodMode;
     uint32_t lodLevel;
+    VkDeviceAddress lodNodes;
+    VkDeviceAddress lodGroups;
+    VkDeviceAddress traversal;
+    VkDeviceAddress candidates;
+    VkDeviceAddress queue0;
+    VkDeviceAddress queue1;
+    uint32_t lodRootCount;
+    uint32_t lodLevelCount;
+    uint32_t pad3[2];
 };
-static_assert(sizeof(GpuGlobals) == 272, "GpuGlobals layout mismatch");
+static_assert(sizeof(GpuGlobals) == 336, "GpuGlobals layout mismatch");
+static_assert(offsetof(GpuGlobals, lodNodes) == 272, "GpuGlobals layout mismatch");
+
+constexpr uint32_t kMaxBvhDepth = 64;    // MAX_BVH_DEPTH in common.glsl
+constexpr uint32_t kBvhGroupSize = 64;   // BVH_GROUP_SIZE
+constexpr uint32_t kFlagLodCandidates = 8; // FLAG_LOD_CANDIDATES
+
+// Must match TraversalBuffer in shaders/common.glsl
+struct GpuTraversal
+{
+    uint32_t dispatch[3];
+    uint32_t candidateCount;
+    uint32_t nodesVisited;
+    uint32_t pad[3];
+    uint32_t queueCount[kMaxBvhDepth];
+};
 
 // Must match `PushConstants` in shaders/common.glsl
 struct PushConstants
@@ -55,6 +84,9 @@ struct PushConstants
     VkDeviceAddress fallbackTriangles;
     VkDeviceAddress stats;
     VkDeviceAddress lods;
+    VkDeviceAddress edgeMasks;
+    uint32_t traversalDepth;
+    uint32_t padding;
 };
 
 struct GpuStats
@@ -78,7 +110,7 @@ VkShaderModule createShaderModule(VkDevice device, const uint32_t* code, size_t 
 }
 
 // Extracts normalized left/right/bottom/top planes from a column-major view-projection matrix.
-void extractFrustum(const mat4& vp, float planes[4][4])
+void extractFrustum(const Eigen::Matrix4f& vp, float planes[4][4])
 {
     for (int i = 0; i < 4; ++i)
     {
@@ -86,7 +118,7 @@ void extractFrustum(const mat4& vp, float planes[4][4])
         float sign = (i % 2) ? -1.f : 1.f;
         float p[4];
         for (int c = 0; c < 4; ++c)
-            p[c] = vp.at(3, c) + sign * vp.at(axis, c);
+            p[c] = vp(3, c) + sign * vp(axis, c);
         float len = std::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
         for (int c = 0; c < 4; ++c)
             planes[i][c] = p[c] / len;
@@ -188,7 +220,7 @@ void MeshletRenderer::destroy()
         ctx->destroyBuffer(frame.stats);
     }
     vkDestroyQueryPool(ctx->device, timestamps, nullptr);
-    for (VkPipeline pipeline : {meshPipeline, vertexPipeline})
+    for (VkPipeline pipeline : {meshPipeline, vertexPipeline, traversePipeline, finalizePipeline})
         if (pipeline)
             vkDestroyPipeline(ctx->device, pipeline, nullptr);
     vkDestroyPipelineLayout(ctx->device, layout, nullptr);
@@ -203,7 +235,23 @@ void MeshletRenderer::destroy()
 void MeshletRenderer::createPipelines()
 {
     if (ctx->caps.meshShader)
+    {
         meshPipeline = createPipeline(true);
+
+        for (bool traverse : {true, false})
+        {
+            VkShaderModule module = traverse ? createShaderModule(ctx->device, kLodTraverseSpv, sizeof(kLodTraverseSpv))
+                                             : createShaderModule(ctx->device, kLodFinalizeSpv, sizeof(kLodFinalizeSpv));
+            VkComputePipelineCreateInfo info = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            info.stage.module = module;
+            info.stage.pName = "main";
+            info.layout = layout;
+            VK_CHECK(vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &info, nullptr, traverse ? &traversePipeline : &finalizePipeline));
+            vkDestroyShaderModule(ctx->device, module, nullptr);
+        }
+    }
     else
         vertexPipeline = createPipeline(false);
 }
@@ -320,12 +368,14 @@ void MeshletRenderer::upload(const Model& model, const MeshletData& data)
         meshletVertices = ctx->createDeviceBuffer(data.vertices.data(), data.vertices.size() * sizeof(uint32_t), usage);
         meshletTriangles = ctx->createDeviceBuffer(data.triangles.data(), data.triangles.size(), usage);
         bounds = ctx->createDeviceBuffer(data.bounds.data(), data.bounds.size() * sizeof(MeshletBounds), usage);
+        edgeMasks = ctx->createDeviceBuffer(data.edgeMasks.data(), data.edgeMasks.size(), usage);
     }
     else
     {
         // Vertex fallback: expand the level-0 meshlets into a flat corner list + per-triangle ids
         std::vector<uint32_t> indices;
         std::vector<uint32_t> triangles;
+        std::vector<uint8_t> masks; // per drawn triangle
         indices.reserve(data.baseTriangleCount * 3);
         triangles.reserve(data.baseTriangleCount);
         fallbackClusters = 0;
@@ -340,17 +390,40 @@ void MeshletRenderer::upload(const Model& model, const MeshletData& data)
                 for (uint32_t k = 0; k < 3; ++k)
                     indices.push_back(data.vertices[m.vertex_offset + data.triangles[m.triangle_offset + t * 3 + k]]);
                 triangles.push_back(uint32_t(mi << kTriBits) | t);
+                masks.push_back(data.edgeMasks[m.triangle_offset / 3 + t]);
             }
         }
         fallbackIndices = ctx->createDeviceBuffer(indices.data(), indices.size() * sizeof(uint32_t), usage);
         fallbackTriangles = ctx->createDeviceBuffer(triangles.data(), triangles.size() * sizeof(uint32_t), usage);
         fallbackTriangleCount = uint32_t(triangles.size());
+        masks.resize((masks.size() + 3) & ~size_t(3));
+        edgeMasks = ctx->createDeviceBuffer(masks.data(), masks.size(), usage);
     }
     lods = ctx->createDeviceBuffer(data.lods.data(), data.lods.size() * sizeof(MeshletLod), usage); // also read by the fragment shader
 
+    if (usesMeshShaders() && !data.lodNodes.empty() && data.lodNodesPerDepth.size() <= kMaxBvhDepth)
+    {
+        lodNodes = ctx->createDeviceBuffer(data.lodNodes.data(), data.lodNodes.size() * sizeof(LodNode), usage);
+        lodGroups = ctx->createDeviceBuffer(data.lodGroups.data(), data.lodGroups.size() * sizeof(LodGroupRange), usage);
+        lodRootCount = data.lodRootCount;
+        lodNodesPerDepth = data.lodNodesPerDepth;
+
+        uint32_t maxQueue = 0;
+        for (uint32_t count : lodNodesPerDepth)
+            maxQueue = std::max(maxQueue, count);
+        for (PerFrame& frame : frames)
+        {
+            frame.traversal = ctx->createBuffer(sizeof(GpuTraversal), usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, true);
+            frame.candidates = ctx->createBuffer(data.meshlets.size() * sizeof(uint32_t), usage, false);
+            for (Buffer& queue : frame.queues)
+                queue = ctx->createBuffer(VkDeviceSize(maxQueue) * sizeof(uint32_t), usage, false);
+        }
+    }
+
     meshletCount = uint32_t(data.meshlets.size());
+    lodLevelCount = uint32_t(std::max<size_t>(1, data.levelClusters.size()));
     triangleCount = uint32_t(data.triangleCount);
-    sceneBytes = size_t(vertices.size + meshlets.size + meshletVertices.size + meshletTriangles.size + bounds.size + lods.size +
+    sceneBytes = size_t(vertices.size + meshlets.size + meshletVertices.size + meshletTriangles.size + bounds.size + lods.size + edgeMasks.size +
                         fallbackIndices.size + fallbackTriangles.size);
 }
 
@@ -360,8 +433,14 @@ void MeshletRenderer::releaseScene()
         return;
     if (vertices.buffer)
         VK_CHECK(vkDeviceWaitIdle(ctx->device));
-    for (Buffer* buffer : {&vertices, &meshlets, &meshletVertices, &meshletTriangles, &bounds, &lods, &fallbackIndices, &fallbackTriangles})
+    for (Buffer* buffer : {&vertices, &meshlets, &meshletVertices, &meshletTriangles, &bounds, &lods, &lodNodes, &lodGroups, &edgeMasks,
+             &fallbackIndices, &fallbackTriangles})
         ctx->destroyBuffer(*buffer);
+    for (PerFrame& frame : frames)
+        for (Buffer* buffer : {&frame.traversal, &frame.candidates, &frame.queues[0], &frame.queues[1]})
+            ctx->destroyBuffer(*buffer);
+    lodRootCount = 0;
+    lodNodesPerDepth.clear();
     meshletCount = triangleCount = 0;
     fallbackClusters = fallbackTriangleCount = 0;
     sceneBytes = 0;
@@ -385,6 +464,14 @@ FrameStats MeshletRenderer::collectStats(uint32_t frameIndex)
         VK_SUCCESS)
         result.gpuMs = double(ticks[1] - ticks[0]) * double(timestampPeriod) * 1e-6;
 
+    if (frame.usedBvh)
+    {
+        const GpuTraversal* traversal = static_cast<const GpuTraversal*>(frame.traversal.mapped);
+        result.bvh = true;
+        result.bvhNodesVisited = traversal->nodesVisited;
+        result.bvhCandidates = traversal->candidateCount;
+    }
+
     result.valid = true;
     return result;
 }
@@ -396,38 +483,45 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
 
     // per-frame constants (frame fence has been waited on, so the buffers are free)
     GpuGlobals globals = {};
-    std::memcpy(globals.viewProj, params.viewProj.m, sizeof(globals.viewProj));
+    std::memcpy(globals.viewProj, params.viewProj.data(), sizeof(globals.viewProj)); // column-major, like GLSL
     extractFrustum(params.cullViewProj, globals.frustum);
-    globals.cameraPos[0] = params.cameraPos.x;
-    globals.cameraPos[1] = params.cameraPos.y;
-    globals.cameraPos[2] = params.cameraPos.z;
-    globals.lightDir[0] = params.lightDir.x;
-    globals.lightDir[1] = params.lightDir.y;
-    globals.lightDir[2] = params.lightDir.z;
+    Eigen::Map<Eigen::Vector3f>(globals.cameraPos) = params.cameraPos;
+    Eigen::Map<Eigen::Vector3f>(globals.lightDir) = params.lightDir;
     globals.meshletCount = meshletCount;
     globals.mode = uint32_t(params.mode);
     globals.highlight = params.highlight;
-    const bool wireframe = params.wireframe && params.wireWidth > 0.f && supportsWireframe();
+    const bool wireframe = params.wireframe && (params.wireWidth > 0.f || params.outlineWidth > 0.f) && supportsWireframe();
     globals.flags = (params.frustumCull ? 1u : 0u) | (params.coneCull ? 2u : 0u) | (wireframe ? 4u : 0u);
     globals.wireWidth = params.wireWidth;
+    globals.outlineWidth = params.outlineWidth;
+    globals.lodLevelCount = lodLevelCount;
     globals.matcap = params.matcap >= 0 && size_t(params.matcap) < matcapNames.size() ? params.matcap : -1;
-    const vec3 basis[3] = {params.viewRight, params.viewUp, params.viewBack};
-    float* basisOut[3] = {globals.viewRight, globals.viewUp, globals.viewBack};
-    for (int i = 0; i < 3; ++i)
-    {
-        basisOut[i][0] = basis[i].x;
-        basisOut[i][1] = basis[i].y;
-        basisOut[i][2] = basis[i].z;
-    }
+    Eigen::Map<Eigen::Vector3f>(globals.viewRight) = params.viewRight;
+    Eigen::Map<Eigen::Vector3f>(globals.viewUp) = params.viewUp;
+    Eigen::Map<Eigen::Vector3f>(globals.viewBack) = params.viewBack;
 
-    globals.lodCamera[0] = params.cullCameraPos.x;
-    globals.lodCamera[1] = params.cullCameraPos.y;
-    globals.lodCamera[2] = params.cullCameraPos.z;
+    Eigen::Map<Eigen::Vector3f>(globals.lodCamera) = params.cullCameraPos;
     globals.lodCamera[3] = params.zNear;
     globals.lodScale = params.lodScale;
     globals.lodThreshold = params.lodThreshold;
     globals.lodMode = params.lodAuto ? 0u : 1u;
     globals.lodLevel = uint32_t(std::max(params.lodLevel, 0));
+
+    // automatic LOD selection walks the BVH (compute) and the task shader only sees the candidates
+    const bool useBvh = hasLodBvh() && params.lodAuto && meshletCount > 0;
+    frame.usedBvh = useBvh;
+    if (useBvh)
+    {
+        globals.flags |= kFlagLodCandidates;
+        globals.lodNodes = lodNodes.address;
+        globals.lodGroups = lodGroups.address;
+        globals.traversal = frame.traversal.address;
+        globals.candidates = frame.candidates.address;
+        globals.queue0 = frame.queues[0].address;
+        globals.queue1 = frame.queues[1].address;
+        globals.lodRootCount = lodRootCount;
+        std::memset(frame.traversal.mapped, 0, sizeof(GpuTraversal)); // frame fence was waited on
+    }
     std::memcpy(frame.globals.mapped, &globals, sizeof(globals));
 
     GpuStats zero = {};
@@ -442,6 +536,50 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
 
     vkCmdResetQueryPool(cmd, timestamps, frameIndex * 2, 2);
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, timestamps, frameIndex * 2);
+
+    PushConstants push = {};
+    push.globals = frame.globals.address;
+    push.vertices = vertices.address;
+    push.meshlets = meshlets.address;
+    push.meshletVertices = meshletVertices.address;
+    push.meshletTriangles = meshletTriangles.address;
+    push.bounds = bounds.address;
+    push.fallbackIndices = fallbackIndices.address;
+    push.fallbackTriangles = fallbackTriangles.address;
+    push.stats = frame.stats.address;
+    push.lods = lods.address;
+    push.edgeMasks = edgeMasks.address;
+
+    if (useBvh)
+    {
+        auto computeBarrier = [&](VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
+            VkMemoryBarrier2 barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            barrier.dstStageMask = dstStage;
+            barrier.dstAccessMask = dstAccess;
+            VkDependencyInfo dep = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &barrier;
+            vkCmdPipelineBarrier2(cmd, &dep);
+        };
+
+        // one dispatch per BVH depth; each depth's node count bounds its queue
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, traversePipeline);
+        for (uint32_t depth = 0; depth < uint32_t(lodNodesPerDepth.size()); ++depth)
+        {
+            push.traversalDepth = depth;
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+            vkCmdDispatch(cmd, (lodNodesPerDepth[depth] + kBvhGroupSize - 1) / kBvhGroupSize, 1, 1);
+            computeBarrier(VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, finalizePipeline);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        computeBarrier(VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_TASK_SHADER_BIT_EXT,
+            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        push.traversalDepth = 0;
+    }
 
     VkImage image = sc.images[imageIndex];
     transitionImage(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -474,25 +612,15 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     renderingInfo.pDepthAttachment = &depthAttachment;
     vkCmdBeginRendering(cmd, &renderingInfo);
 
-    VkViewport vp = {0, 0, float(sc.extent.width), float(sc.extent.height), 0, 1};
-    VkRect2D scissor = {{0, 0}, sc.extent};
+    // 3D view right of the sidebar; ImGui sets its own full-screen viewport afterwards
+    const float viewX = std::clamp(std::floor(params.viewportX), 0.f, float(sc.extent.width) - 1.f);
+    VkViewport vp = {viewX, 0, float(sc.extent.width) - viewX, float(sc.extent.height), 0, 1};
+    VkRect2D scissor = {{int32_t(viewX), 0}, {sc.extent.width - uint32_t(viewX), sc.extent.height}};
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     if (meshletCount == 0)
         return;
-
-    PushConstants push = {};
-    push.globals = frame.globals.address;
-    push.vertices = vertices.address;
-    push.meshlets = meshlets.address;
-    push.meshletVertices = meshletVertices.address;
-    push.meshletTriangles = meshletTriangles.address;
-    push.bounds = bounds.address;
-    push.fallbackIndices = fallbackIndices.address;
-    push.fallbackTriangles = fallbackTriangles.address;
-    push.stats = frame.stats.address;
-    push.lods = lods.address;
 
     const uint32_t taskGroups = (meshletCount + kTaskGroupSize - 1) / kTaskGroupSize;
 
@@ -500,7 +628,9 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, usesMeshShaders() ? meshPipeline : vertexPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &descriptorSet, 0, nullptr);
     vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
-    if (usesMeshShaders())
+    if (useBvh)
+        vkCmdDrawMeshTasksIndirectEXT(cmd, frame.traversal.buffer, 0, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
+    else if (usesMeshShaders())
         vkCmdDrawMeshTasksEXT(cmd, taskGroups, 1, 1);
     else
         vkCmdDraw(cmd, fallbackTriangleCount * 3, 1, 0, 0);

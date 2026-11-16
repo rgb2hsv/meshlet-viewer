@@ -78,6 +78,24 @@ struct MeshletBounds
     float coneCutoff;
 };
 
+// BVH node over cluster groups (clodBuildHierarchy), std430 layout (32 bytes). Bounds are the
+// conservative merge of the subtree's group error spheres; error is the subtree's maximum.
+struct LodNode
+{
+    float center[3];
+    float radius;
+    float error;          // FLT_MAX when the subtree contains a terminal group
+    int32_t group;        // leaf: group index; internal: -1
+    uint32_t childOffset; // internal: children are nodes[childOffset, childOffset + childCount)
+    uint32_t childCount;
+};
+
+struct LodGroupRange
+{
+    uint32_t firstCluster; // a group's clusters are contiguous in MeshletData::meshlets
+    uint32_t clusterCount;
+};
+
 struct MeshletData
 {
     std::vector<meshopt_Meshlet> meshlets;
@@ -85,6 +103,9 @@ struct MeshletData
     std::vector<uint8_t> triangles;  // 3 local indices per triangle, padded to a multiple of 4 bytes
     std::vector<MeshletBounds> bounds;
     std::vector<MeshletLod> lods; // one per meshlet; level 0 + "always selected" without LOD
+    // per triangle (index triangle_offset / 3 + t): bit i set when the edge opposite local vertex i
+    // lies on the meshlet's perimeter (used by no other triangle of the meshlet); padded to 4 bytes
+    std::vector<uint8_t> edgeMasks;
 
     double buildSeconds = 0;
     size_t triangleCount = 0;     // all levels
@@ -92,6 +113,12 @@ struct MeshletData
     bool lod = false;
     std::vector<size_t> levelClusters, levelTriangles; // per DAG level
     size_t coarsestTriangles = 0; // triangles in the coarsest possible cut (terminal clusters)
+
+    // LOD selection BVH (only with lod): one tree per DAG level, roots are nodes[0, rootCount)
+    std::vector<LodNode> lodNodes;
+    std::vector<LodGroupRange> lodGroups;
+    uint32_t lodRootCount = 0;
+    std::vector<uint32_t> lodNodesPerDepth; // node count at each BVH tree depth (dispatch sizes)
     float avgVertices = 0, avgTriangles = 0; // level 0
     float vertexFill = 0, triangleFill = 0; // average utilisation of max sizes
     float avgConeAngleDeg = 0; // average normal-cone spread of cullable meshlets
