@@ -34,7 +34,7 @@ cmake --build build
 ## Run
 
 ```bash
-./build/meshlets                       # loads assets/lucy.ply if present (Z-up)
+./build/meshlets                       # loads assets/model/metasphere.ply
 ./build/meshlets path/to/model.ply     # or -i/--input PATH
 ./build/meshlets -a flex --max-vertices 128 --max-triangles 128 --min-triangles 64
 ./build/meshlets -c shaded --matcap metal_carpaint --wireframe --wire-width 0.05
@@ -64,7 +64,9 @@ after every build.
 `assets/matcap/license.txt`). They were converted from Blender's EXRs as
 diffuse + specular (the look of a white material), clipped to [0, 1] and stored as 8-bit sRGB.
 
-The default model, `assets/lucy.ply`, is not in the repository (533 MB). It is the Stanford
-Lucy scan from the Stanford 3D Scanning Repository (http://graphics.stanford.edu/data/3Dscanrep/);
-download it and place it at `assets/lucy.ply`, or pass any other model on the command line.
+The default model is `assets/model/metasphere.ply` (66K vertices, 132K triangles). For a
+large stress test, the Stanford Lucy scan (14M vertices, 28M triangles, 533 MB) from the
+Stanford 3D Scanning Repository (http://graphics.stanford.edu/data/3Dscanrep/) works well:
+`./build/meshlets path/to/lucy.ply --z-up`. It is not in the repository; `assets/lucy.ply`
+is git-ignored if you keep a local copy there.
 Its terms allow research use and ask for attribution.

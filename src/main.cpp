@@ -594,7 +594,7 @@ void saveScreenshot(VulkanContext& ctx, uint32_t imageIndex, const char* path)
 struct Options
 {
     std::string input;
-    char upAxis = 0; // 0 = auto (Z for the default Lucy model, else Y), 'y' or 'z'
+    char upAxis = 0; // 0 = default (Y), 'y' or 'z'
     bool vertexCache = true;
 
     MeshletSettings meshlets;
@@ -619,14 +619,14 @@ bool parseOptions(int argc, char** argv, Options& opt)
 {
     argparse::ArgumentParser program("meshlets", "0.1.0");
     program.add_description("Splits a PLY/OBJ model into meshlets with meshoptimizer and visualizes them with Vulkan mesh shaders.");
-    program.add_epilog("Example:\n  meshlets assets/lucy.ply --z-up --algorithm flex --max-vertices 128 --max-triangles 128 --min-triangles 64");
+    program.add_epilog("Example:\n  meshlets assets/model/metasphere.ply --algorithm flex --max-vertices 128 --max-triangles 128 --min-triangles 64");
 
     // ---- input ----
     program.add_group("Input");
-    program.add_argument("model").nargs(argparse::nargs_pattern::optional).help("model to load (.ply or .obj); defaults to assets/lucy.ply");
+    program.add_argument("model").nargs(argparse::nargs_pattern::optional).help("model to load (.ply or .obj); defaults to assets/model/metasphere.ply");
     program.add_argument("-i", "--input").metavar("PATH").help("model to load (same as the positional argument)");
-    program.add_argument("--z-up").flag().help("treat +Z as up (default for assets/lucy.ply)");
-    program.add_argument("--y-up").flag().help("treat +Y as up (default for other models)");
+    program.add_argument("--z-up").flag().help("treat +Z as up");
+    program.add_argument("--y-up").flag().help("treat +Y as up (default)");
     program.add_argument("--no-vertex-cache").flag().help("skip meshopt_optimizeVertexCache on the index buffer after loading");
 
     // ---- meshlets ----
@@ -882,24 +882,23 @@ int main(int argc, char** argv)
         app->matcapTextures.push_back(
             ImTextureID(ImGui_ImplVulkan_AddTexture(app->renderer.matcapUiView(i), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)));
 
-    // Default model: assets/lucy.ply (Stanford Lucy, Z-up), looked up in the working
-    // directory first, then in the source tree the binary was built from.
+    // Default model: assets/model/metasphere.ply, looked up in the working directory
+    // first, then in the source tree the binary was built from.
     std::string modelPath = opt.input;
-    bool defaultModel = false;
     if (modelPath.empty())
     {
-        for (const std::string& candidate : {std::string("assets/lucy.ply"), std::string(MESHLETS_ASSET_DIR) + "/lucy.ply"})
+        for (const std::string& candidate :
+            {std::string("assets/model/metasphere.ply"), std::string(MESHLETS_ASSET_DIR) + "/model/metasphere.ply"})
             if (FILE* f = std::fopen(candidate.c_str(), "rb"))
             {
                 std::fclose(f);
                 modelPath = candidate;
-                defaultModel = true;
                 break;
             }
         if (modelPath.empty())
-            std::fprintf(stderr, "note: assets/lucy.ply not found; drop a model onto the window or pass a path\n");
+            std::fprintf(stderr, "note: assets/model/metasphere.ply not found; drop a model onto the window or pass a path\n");
     }
-    app->camera.zUp = opt.upAxis == 'z' || (opt.upAxis == 0 && defaultModel);
+    app->camera.zUp = opt.upAxis == 'z';
     if (!modelPath.empty())
         app->startLoad(modelPath);
 
