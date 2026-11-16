@@ -1,7 +1,7 @@
 #pragma once
 
 #include "matcap.h"
-#include "math.h"
+#include "camera_math.h"
 #include "model.h"
 #include "vk_context.h"
 

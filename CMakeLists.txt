@@ -124,6 +124,8 @@ target_link_libraries(meshlets PRIVATE meshoptimizer argparse::argparse imgui::i
 
 if(MSVC)
     target_compile_options(meshlets PRIVATE /W4)
+    # M_PI etc. from <cmath>; silence fopen/sscanf "unsafe" deprecation warnings
+    target_compile_definitions(meshlets PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
     target_compile_options(meshlets PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
 endif()

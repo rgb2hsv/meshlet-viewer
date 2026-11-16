@@ -1,7 +1,7 @@
 // meshlets: load a PLY/OBJ model, split it into meshlets with meshoptimizer and
 // visualize them with Vulkan mesh shaders (vertex-shader fallback) + Dear ImGui.
 #include "matcap.h"
-#include "math.h"
+#include "camera_math.h"
 #include "model.h"
 #include "renderer.h"
 #include "vk_context.h"
