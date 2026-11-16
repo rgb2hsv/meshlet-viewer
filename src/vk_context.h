@@ -35,6 +35,7 @@ struct Image
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView unormView = VK_NULL_HANDLE; // textures only: raw sRGB bytes, for ImGui
     VkFormat format = VK_FORMAT_UNDEFINED;
 };
 
@@ -65,7 +66,7 @@ struct DeviceCaps
     uint32_t maxMeshOutputVertices = 0;
     uint32_t maxMeshOutputPrimitives = 0;
     uint32_t maxTaskWorkGroupCount = 0;
-    bool fillModeNonSolid = false;
+    bool barycentric = false; // VK_KHR_fragment_shader_barycentric (wireframe on the mesh shader path)
     VkPhysicalDeviceProperties props = {};
 };
 
@@ -96,6 +97,11 @@ struct VulkanContext
     Buffer createDeviceBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage);
     void destroyBuffer(Buffer& buffer);
 
+    // RGBA8 sRGB texture, uploaded and left in SHADER_READ_ONLY_OPTIMAL (blocking).
+    // `view` samples as linear (SRGB format); `unormView` returns the stored bytes.
+    Image createTexture(uint32_t width, uint32_t height, const void* rgba8);
+    void destroyImage(Image& image);
+
 private:
     void createInstance(bool validation);
     void pickPhysicalDevice(bool disableMeshShaders);
@@ -104,6 +110,7 @@ private:
     void destroySwapchainResources();
     void createFrames();
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags flags);
+    void submitImmediate(void (*record)(VkCommandBuffer, void*), void* user);
 };
 
 void transitionImage(VkCommandBuffer cmd, VkImage image, VkImageAspectFlags aspect, VkImageLayout from, VkImageLayout to,

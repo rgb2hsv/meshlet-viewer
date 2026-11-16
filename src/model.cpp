@@ -658,6 +658,24 @@ bool loadModel(const std::string& path, Model& model, std::string& error, bool o
         }
     }
 
+    // average edge length over (up to) ~1M evenly sampled triangles
+    {
+        const size_t triangleCount = model.indices.size() / 3;
+        const size_t step = std::max<size_t>(1, triangleCount / (1u << 20));
+        double total = 0;
+        size_t edges = 0;
+        for (size_t t = 0; t < triangleCount; t += step)
+            for (int k = 0; k < 3; ++k)
+            {
+                const Vertex& a = model.vertices[model.indices[t * 3 + size_t(k)]];
+                const Vertex& b = model.vertices[model.indices[t * 3 + size_t((k + 1) % 3)]];
+                float dx = a.px - b.px, dy = a.py - b.py, dz = a.pz - b.pz;
+                total += std::sqrt(double(dx * dx + dy * dy + dz * dz));
+                edges++;
+            }
+        model.avgEdgeLength = edges ? float(total / double(edges)) : 0.f;
+    }
+
     model.loadSeconds = secondsSince(start);
     return true;
 }

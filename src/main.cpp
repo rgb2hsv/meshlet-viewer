@@ -1,5 +1,6 @@
 // meshlets: load a PLY/OBJ model, split it into meshlets with meshoptimizer and
 // visualize them with Vulkan mesh shaders (vertex-shader fallback) + Dear ImGui.
+#include "matcap.h"
 #include "math.h"
 #include "model.h"
 #include "renderer.h"
@@ -74,6 +75,14 @@ struct Camera
         return target + dir * distance;
     }
 
+    void basis(vec3& right, vec3& camUp, vec3& back) const
+    {
+        vec3 forward = normalize(target - eye());
+        right = normalize(cross(forward, up()));
+        camUp = cross(right, forward);
+        back = forward * -1.f;
+    }
+
     // Light from the upper left, slightly behind the viewer
     vec3 lightDir() const
     {
@@ -146,6 +155,8 @@ struct App
     bool autoRebuild = true;
     bool rebuildPending = false;
     float initialZoom = 1.f;
+    float wireWidthOverride = 0.f; // from --wire-width; 0 = automatic
+    static constexpr float kAutoWireFraction = 0.1f; // default width = 10% of the average edge
     bool firstLoad = true;
     bool loadFailed = false; // a load failed and no model is available
 
@@ -158,6 +169,7 @@ struct App
     char pathInput[1024] = {};
 
     DrawParams draw;
+    std::vector<ImTextureID> matcapTextures; // ImGui handles for the selector thumbnails
     FrameStats stats;
 
     bool busy() const { return job.valid(); }
@@ -228,6 +240,7 @@ struct App
                 model = result.model;
                 camera.frame(*model);
                 camera.distance /= initialZoom;
+                draw.wireWidth = firstLoad && wireWidthOverride > 0.f ? wireWidthOverride : model->avgEdgeLength * kAutoWireFraction;
                 if (!firstLoad)
                     draw.highlight = -1; // keep --highlight for the first model
                 firstLoad = false;
@@ -239,9 +252,9 @@ struct App
 
             const MeshletData& m = *meshlets;
             const char* algorithmNames[] = {"greedy", "flex", "spatial", "scan"};
-            std::printf("%s: %zu vertices, %zu triangles | %s v%d t%d -> %zu meshlets, avg %.1f verts / %.1f tris, "
+            std::printf("%s: %zu vertices, %zu triangles, avg edge %.4g | %s v%d t%d -> %zu meshlets, avg %.1f verts / %.1f tris, "
                         "cone-cullable %.0f%%, build %.2fs\n",
-                fileName(model->path).c_str(), model->vertices.size(), model->indices.size() / 3, algorithmNames[int(settings.algorithm)],
+                fileName(model->path).c_str(), model->vertices.size(), model->indices.size() / 3, model->avgEdgeLength, algorithmNames[int(settings.algorithm)],
                 settings.maxVertices, settings.maxTriangles, m.meshlets.size(), m.avgVertices, m.avgTriangles,
                 100.0 * double(m.coneCullable) / double(m.meshlets.size()), m.buildSeconds);
             std::fflush(stdout);
@@ -397,9 +410,61 @@ void App::ui()
         if (ImGui::Combo("Color", &mode, modes, IM_ARRAYSIZE(modes)))
             draw.mode = ColorMode(mode);
 
-        ImGui::BeginDisabled(!ctx.caps.fillModeNonSolid);
+        if (draw.mode == ColorMode::Shaded && renderer.matcapCount() > 0)
+        {
+            // Blender matcap selector: combo + thumbnail grid
+            const char* preview = draw.matcap >= 0 ? renderer.matcapName(size_t(draw.matcap)).c_str() : "none (plain lighting)";
+            if (ImGui::BeginCombo("Matcap", preview))
+            {
+                if (ImGui::Selectable("none (plain lighting)", draw.matcap < 0))
+                    draw.matcap = -1;
+                for (size_t i = 0; i < renderer.matcapCount(); ++i)
+                    if (ImGui::Selectable(renderer.matcapName(i).c_str(), draw.matcap == int(i)))
+                        draw.matcap = int(i);
+                ImGui::EndCombo();
+            }
+
+            const float thumb = 26.f;
+            const ImGuiStyle& style = ImGui::GetStyle();
+            const float rowWidth = ImGui::GetContentRegionAvail().x;
+            float x = 0.f;
+            for (size_t i = 0; i < matcapTextures.size(); ++i)
+            {
+                const float buttonWidth = thumb + style.FramePadding.x * 2.f;
+                if (i > 0 && x + style.ItemSpacing.x + buttonWidth <= rowWidth)
+                {
+                    ImGui::SameLine();
+                    x += style.ItemSpacing.x;
+                }
+                else
+                    x = 0.f;
+                x += buttonWidth;
+
+                const bool selected = draw.matcap == int(i);
+                ImGui::PushID(int(i));
+                ImVec4 bg = selected ? ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive) : ImVec4(0, 0, 0, 0);
+                if (ImGui::ImageButton("##matcap", matcapTextures[i], ImVec2(thumb, thumb), ImVec2(0, 0), ImVec2(1, 1), bg))
+                    draw.matcap = int(i);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", renderer.matcapName(i).c_str());
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::BeginDisabled(!renderer.supportsWireframe());
         ImGui::Checkbox("Wireframe", &draw.wireframe);
+        if (!renderer.supportsWireframe() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("needs VK_KHR_fragment_shader_barycentric");
         ImGui::EndDisabled();
+        if (draw.wireframe && model)
+        {
+            // width is in model units; the slider range follows the mesh resolution
+            const float edge = std::max(model->avgEdgeLength, 1e-12f);
+            ImGui::SetNextItemWidth(160);
+            ImGui::SliderFloat("Line width", &draw.wireWidth, edge * 0.005f, edge * 2.f, "%.3g units", ImGuiSliderFlags_Logarithmic);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(%.0f%% of avg edge)", 100.f * draw.wireWidth / edge);
+        }
 
         ImGui::BeginDisabled(!renderer.usesMeshShaders());
         ImGui::Checkbox("Frustum culling", &draw.frustumCull);
@@ -535,7 +600,9 @@ struct Options
     MeshletSettings meshlets;
 
     ColorMode colorMode = ColorMode::Meshlet;
+    std::string matcap = "clay_studio"; // Blender matcap for --color shaded; "none" = plain lighting
     bool wireframe = false;
+    float wireWidth = 0.f; // model units; 0 = automatic
     bool frustumCull = true;
     bool coneCull = true;
     int highlight = -1;
@@ -580,7 +647,9 @@ bool parseOptions(int argc, char** argv, Options& opt)
     // ---- view ----
     program.add_group("View");
     program.add_argument("-c", "--color").default_value(std::string("meshlet")).nargs(1).choices("meshlet", "triangle", "normal", "shaded").help("color mode");
+    program.add_argument("--matcap").metavar("NAME").default_value(std::string("clay_studio")).nargs(1).help("Blender matcap from assets/matcap for --color shaded (file name without .png, or none)");
     program.add_argument("--wireframe").flag().help("draw a wireframe overlay");
+    program.add_argument("--wire-width").metavar("W").default_value(0.f).nargs(1).scan<'g', float>().help("wireframe line width in model units (0 = 10% of the average edge length)");
     program.add_argument("--no-frustum-cull").flag().help("disable task-shader frustum culling");
     program.add_argument("--no-cone-cull").flag().help("disable task-shader normal cone (backface) culling");
     program.add_argument("--highlight").metavar("INDEX").default_value(-1).nargs(1).scan<'i', int>().help("highlight one meshlet by index");
@@ -666,11 +735,19 @@ bool parseOptions(int argc, char** argv, Options& opt)
 
     // view
     const std::string color = program.get<std::string>("--color");
+    opt.matcap = program.get<std::string>("--matcap");
+    if (program.is_used("--matcap") && color != "shaded")
+        std::fprintf(stderr, "warning: --matcap only affects --color shaded\n");
     opt.colorMode = color == "triangle" ? ColorMode::Triangle
                     : color == "normal" ? ColorMode::Normal
                     : color == "shaded" ? ColorMode::Shaded
                                         : ColorMode::Meshlet;
     opt.wireframe = program.get<bool>("--wireframe");
+    opt.wireWidth = program.get<float>("--wire-width");
+    if (opt.wireWidth < 0.f)
+        return fail("--wire-width must be >= 0");
+    if (program.is_used("--wire-width") && !opt.wireframe)
+        std::fprintf(stderr, "warning: --wire-width has no effect without --wireframe\n");
     opt.frustumCull = !program.get<bool>("--no-frustum-cull");
     opt.coneCull = !program.get<bool>("--no-cone-cull");
     opt.highlight = std::max(-1, program.get<int>("--highlight"));
@@ -728,7 +805,28 @@ int main(int argc, char** argv)
     auto app = std::make_unique<App>();
     VulkanContext& ctx = app->ctx;
     ctx.init(window, opt.validation, opt.noMeshShaders);
-    app->renderer.init(ctx);
+    std::string matcapError;
+    std::vector<Matcap> matcaps = loadMatcaps(matcapError);
+    if (!matcapError.empty())
+        std::fprintf(stderr, "warning: %s\n", matcapError.c_str());
+    app->renderer.init(ctx, matcaps);
+
+    // --matcap NAME -> index
+    if (opt.matcap != "none")
+    {
+        for (size_t i = 0; i < matcaps.size(); ++i)
+            if (matcaps[i].name == opt.matcap)
+                app->draw.matcap = int(i);
+        if (app->draw.matcap < 0 && !matcaps.empty())
+        {
+            std::string names;
+            for (const Matcap& matcap : matcaps)
+                names += " " + matcap.name;
+            std::fprintf(stderr, "error: unknown matcap '%s'. Available: none%s\n", opt.matcap.c_str(), names.c_str());
+            return 1;
+        }
+    }
+    matcaps.clear(); // pixels now live on the GPU
 
     std::printf("GPU: %s (%s)\n", ctx.caps.props.deviceName, app->renderer.usesMeshShaders() ? "mesh shaders" : "vertex fallback");
 
@@ -744,7 +842,10 @@ int main(int argc, char** argv)
     }
     app->optimizeVertexCache = opt.vertexCache;
     app->draw.mode = opt.colorMode;
-    app->draw.wireframe = opt.wireframe && ctx.caps.fillModeNonSolid;
+    app->draw.wireframe = opt.wireframe;
+    app->wireWidthOverride = opt.wireWidth;
+    if (opt.wireframe && !app->renderer.supportsWireframe())
+        std::fprintf(stderr, "warning: wireframe needs VK_KHR_fragment_shader_barycentric on the mesh shader path\n");
     app->draw.frustumCull = opt.frustumCull;
     app->draw.coneCull = opt.coneCull;
     app->draw.highlight = opt.highlight;
@@ -767,7 +868,7 @@ int main(int argc, char** argv)
     initInfo.Device = ctx.device;
     initInfo.QueueFamily = ctx.queueFamily;
     initInfo.Queue = ctx.queue;
-    initInfo.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE;
+    initInfo.DescriptorPoolSize = IMGUI_IMPL_VULKAN_MINIMUM_SAMPLED_IMAGE_POOL_SIZE + uint32_t(app->renderer.matcapCount());
     initInfo.MinImageCount = ctx.swapchain.minImageCount;
     initInfo.ImageCount = uint32_t(ctx.swapchain.images.size());
     initInfo.UseDynamicRendering = true;
@@ -777,6 +878,9 @@ int main(int argc, char** argv)
     initInfo.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = ctx.swapchain.depth.format;
     initInfo.CheckVkResultFn = checkVkResult;
     ImGui_ImplVulkan_Init(&initInfo);
+    for (size_t i = 0; i < app->renderer.matcapCount(); ++i)
+        app->matcapTextures.push_back(
+            ImTextureID(ImGui_ImplVulkan_AddTexture(app->renderer.matcapUiView(i), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)));
 
     // Default model: assets/lucy.ply (Stanford Lucy, Z-up), looked up in the working
     // directory first, then in the source tree the binary was built from.
@@ -872,6 +976,7 @@ int main(int argc, char** argv)
         app->draw.viewProj = app->camera.viewProj(aspect);
         app->draw.cameraPos = app->camera.eye();
         app->draw.lightDir = app->camera.lightDir();
+        app->camera.basis(app->draw.viewRight, app->draw.viewUp, app->draw.viewBack);
         app->renderer.record(cmd, frameIndex, imageIndex, app->draw,
             [](VkCommandBuffer c) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), c); });
 

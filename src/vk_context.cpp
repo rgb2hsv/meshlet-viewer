@@ -186,10 +186,6 @@ void VulkanContext::pickPhysicalDevice(bool disableMeshShaders)
 
     vkGetPhysicalDeviceProperties(physicalDevice, &caps.props);
 
-    VkPhysicalDeviceFeatures features;
-    vkGetPhysicalDeviceFeatures(physicalDevice, &features);
-    caps.fillModeNonSolid = features.fillModeNonSolid;
-
     if (!disableMeshShaders && hasDeviceExtension(physicalDevice, VK_EXT_MESH_SHADER_EXTENSION_NAME))
     {
         VkPhysicalDeviceMeshShaderFeaturesEXT meshFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
@@ -207,6 +203,15 @@ void VulkanContext::pickPhysicalDevice(bool disableMeshShaders)
         caps.maxMeshOutputPrimitives = meshProps.maxMeshOutputPrimitives;
         caps.maxTaskWorkGroupCount = meshProps.maxTaskWorkGroupCount[0];
     }
+
+    if (caps.meshShader && hasDeviceExtension(physicalDevice, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME))
+    {
+        VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR baryFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+        VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        features2.pNext = &baryFeatures;
+        vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+        caps.barycentric = baryFeatures.fragmentShaderBarycentric;
+    }
 }
 
 void VulkanContext::createDevice()
@@ -221,6 +226,11 @@ void VulkanContext::createDevice()
     meshFeatures.meshShader = VK_TRUE;
     meshFeatures.taskShader = VK_TRUE;
 
+    VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR baryFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+    baryFeatures.fragmentShaderBarycentric = VK_TRUE;
+    if (caps.barycentric)
+        meshFeatures.pNext = &baryFeatures;
+
     VkPhysicalDeviceVulkan13Features features13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
@@ -234,11 +244,13 @@ void VulkanContext::createDevice()
 
     VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features2.pNext = &features12;
-    features2.features.fillModeNonSolid = caps.fillModeNonSolid ? VK_TRUE : VK_FALSE;
+    features2.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE; // matcap texture array
 
     std::vector<const char*> extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     if (caps.meshShader)
         extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    if (caps.barycentric)
+        extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 
     VkDeviceCreateInfo createInfo = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     createInfo.pNext = &features2;
@@ -507,4 +519,106 @@ void VulkanContext::destroyBuffer(Buffer& buffer)
         vkFreeMemory(device, buffer.memory, nullptr);
     }
     buffer = Buffer();
+}
+
+void VulkanContext::submitImmediate(void (*record)(VkCommandBuffer, void*), void* user)
+{
+    VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocInfo.commandPool = uploadPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &cmd));
+
+    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
+    record(cmd, user);
+    VK_CHECK(vkEndCommandBuffer(cmd));
+
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    VK_CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(queue));
+    vkFreeCommandBuffers(device, uploadPool, 1, &cmd);
+}
+
+Image VulkanContext::createTexture(uint32_t width, uint32_t height, const void* rgba8)
+{
+    Image result;
+    result.format = VK_FORMAT_R8G8B8A8_SRGB;
+
+    VkImageCreateInfo imageInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT; // allows the UNORM view
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = result.format;
+    imageInfo.extent = {width, height, 1};
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VK_CHECK(vkCreateImage(device, &imageInfo, nullptr, &result.image));
+
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(device, result.image, &req);
+    VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocInfo.allocationSize = req.size;
+    allocInfo.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VK_CHECK(vkAllocateMemory(device, &allocInfo, nullptr, &result.memory));
+    VK_CHECK(vkBindImageMemory(device, result.image, result.memory, 0));
+
+    for (VkFormat format : {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM})
+    {
+        VkImageViewCreateInfo viewInfo = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewInfo.image = result.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = format;
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VK_CHECK(vkCreateImageView(device, &viewInfo, nullptr, format == VK_FORMAT_R8G8B8A8_SRGB ? &result.view : &result.unormView));
+    }
+
+    const VkDeviceSize size = VkDeviceSize(width) * height * 4;
+    Buffer staging = createBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true);
+    std::memcpy(staging.mapped, rgba8, size_t(size));
+
+    struct Upload
+    {
+        VkImage image;
+        VkBuffer staging;
+        uint32_t width, height;
+    } upload = {result.image, staging.buffer, width, height};
+
+    submitImmediate(
+        [](VkCommandBuffer cmd, void* user) {
+            const Upload& u = *static_cast<const Upload*>(user);
+            transitionImage(cmd, u.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            VkBufferImageCopy region = {};
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            region.imageExtent = {u.width, u.height, 1};
+            vkCmdCopyBufferToImage(cmd, u.staging, u.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            transitionImage(cmd, u.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        },
+        &upload);
+
+    destroyBuffer(staging);
+    return result;
+}
+
+void VulkanContext::destroyImage(Image& image)
+{
+    if (image.image)
+    {
+        if (image.unormView)
+            vkDestroyImageView(device, image.unormView, nullptr);
+        vkDestroyImageView(device, image.view, nullptr);
+        vkDestroyImage(device, image.image, nullptr);
+        vkFreeMemory(device, image.memory, nullptr);
+    }
+    image = Image();
 }

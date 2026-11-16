@@ -19,6 +19,7 @@ struct Model
     std::vector<uint32_t> indices;
     float boundsMin[3] = {0, 0, 0};
     float boundsMax[3] = {0, 0, 0};
+    float avgEdgeLength = 0; // model units; used to pick a default wireframe width
     double loadSeconds = 0;
 };
 

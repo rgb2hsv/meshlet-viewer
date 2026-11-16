@@ -4,6 +4,7 @@
 #include <cstring>
 
 // SPIR-V generated at build time by glslang (see CMakeLists.txt)
+#include "kMeshletFragMeshNoBarySpv.h"
 #include "kMeshletFragMeshSpv.h"
 #include "kMeshletFragVertSpv.h"
 #include "kMeshletMeshSpv.h"
@@ -26,8 +27,14 @@ struct GpuGlobals
     uint32_t mode;
     int32_t highlight;
     uint32_t flags;
+    float wireWidth;
+    int32_t matcap;
+    float pad[2];
+    float viewRight[4];
+    float viewUp[4];
+    float viewBack[4];
 };
-static_assert(sizeof(GpuGlobals) == 176, "GpuGlobals layout mismatch");
+static_assert(sizeof(GpuGlobals) == 240, "GpuGlobals layout mismatch");
 
 // Must match `PushConstants` in shaders/common.glsl
 struct PushConstants
@@ -41,8 +48,6 @@ struct PushConstants
     VkDeviceAddress fallbackIndices;
     VkDeviceAddress fallbackTriangles;
     VkDeviceAddress stats;
-    uint32_t pass;
-    uint32_t padding;
 };
 
 struct GpuStats
@@ -81,16 +86,71 @@ void extractFrustum(const mat4& vp, float planes[4][4])
 
 } // namespace
 
-void MeshletRenderer::init(VulkanContext& context)
+void MeshletRenderer::init(VulkanContext& context, const std::vector<Matcap>& matcaps)
 {
     ctx = &context;
     timestampPeriod = ctx->caps.props.limits.timestampPeriod;
+
+    // --- matcap textures ---
+    for (const Matcap& matcap : matcaps)
+    {
+        matcapImages.push_back(ctx->createTexture(uint32_t(matcap.width), uint32_t(matcap.height), matcap.pixels.data()));
+        matcapNames.push_back(matcap.name);
+    }
+    if (matcapImages.empty())
+    {
+        const uint8_t white[4] = {255, 255, 255, 255};
+        matcapImages.push_back(ctx->createTexture(1, 1, white)); // keeps the descriptor array valid
+    }
+
+    VkSamplerCreateInfo samplerInfo = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.addressModeU = samplerInfo.addressModeV = samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VK_CHECK(vkCreateSampler(ctx->device, &samplerInfo, nullptr, &sampler));
+
+    const uint32_t textureCount = uint32_t(matcapImages.size());
+    VkDescriptorSetLayoutBinding binding = {};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    binding.descriptorCount = textureCount;
+    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo setLayoutInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    setLayoutInfo.bindingCount = 1;
+    setLayoutInfo.pBindings = &binding;
+    VK_CHECK(vkCreateDescriptorSetLayout(ctx->device, &setLayoutInfo, nullptr, &setLayout));
+
+    VkDescriptorPoolSize poolSize = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, textureCount};
+    VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    VK_CHECK(vkCreateDescriptorPool(ctx->device, &poolInfo, nullptr, &descriptorPool));
+
+    VkDescriptorSetAllocateInfo setInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    setInfo.descriptorPool = descriptorPool;
+    setInfo.descriptorSetCount = 1;
+    setInfo.pSetLayouts = &setLayout;
+    VK_CHECK(vkAllocateDescriptorSets(ctx->device, &setInfo, &descriptorSet));
+
+    std::vector<VkDescriptorImageInfo> imageInfos;
+    for (const Image& image : matcapImages)
+        imageInfos.push_back({sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL});
+    VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = descriptorSet;
+    write.dstBinding = 0;
+    write.descriptorCount = textureCount;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.pImageInfo = imageInfos.data();
+    vkUpdateDescriptorSets(ctx->device, 1, &write, 0, nullptr);
 
     VkPushConstantRange range = {};
     range.stageFlags = VK_SHADER_STAGE_ALL;
     range.size = sizeof(PushConstants);
 
     VkPipelineLayoutCreateInfo layoutInfo = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &setLayout;
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges = &range;
     VK_CHECK(vkCreatePipelineLayout(ctx->device, &layoutInfo, nullptr, &layout));
@@ -119,34 +179,38 @@ void MeshletRenderer::destroy()
         ctx->destroyBuffer(frame.stats);
     }
     vkDestroyQueryPool(ctx->device, timestamps, nullptr);
-    for (VkPipeline pipeline : {meshPipeline, meshWirePipeline, vertexPipeline, vertexWirePipeline})
+    for (VkPipeline pipeline : {meshPipeline, vertexPipeline})
         if (pipeline)
             vkDestroyPipeline(ctx->device, pipeline, nullptr);
     vkDestroyPipelineLayout(ctx->device, layout, nullptr);
+    vkDestroyDescriptorPool(ctx->device, descriptorPool, nullptr);
+    vkDestroyDescriptorSetLayout(ctx->device, setLayout, nullptr);
+    vkDestroySampler(ctx->device, sampler, nullptr);
+    for (Image& image : matcapImages)
+        ctx->destroyImage(image);
+    matcapImages.clear();
 }
 
 void MeshletRenderer::createPipelines()
 {
     if (ctx->caps.meshShader)
-    {
-        meshPipeline = createPipeline(true, false);
-        if (ctx->caps.fillModeNonSolid)
-            meshWirePipeline = createPipeline(true, true);
-    }
+        meshPipeline = createPipeline(true);
     else
-    {
-        vertexPipeline = createPipeline(false, false);
-        if (ctx->caps.fillModeNonSolid)
-            vertexWirePipeline = createPipeline(false, true);
-    }
+        vertexPipeline = createPipeline(false);
 }
 
-VkPipeline MeshletRenderer::createPipeline(bool mesh, bool wireframe)
+VkPipeline MeshletRenderer::createPipeline(bool mesh)
 {
     VkDevice device = ctx->device;
 
     std::vector<VkPipelineShaderStageCreateInfo> stages;
     std::vector<VkShaderModule> modules;
+
+    // MATCAP_COUNT (constant_id 0) sizes the sampler array in meshlet.frag
+    const uint32_t matcapTextureCount = uint32_t(matcapImages.size());
+    VkSpecializationMapEntry specEntry = {0, 0, sizeof(uint32_t)};
+    VkSpecializationInfo specInfo = {1, &specEntry, sizeof(uint32_t), &matcapTextureCount};
+
     auto addStage = [&](VkShaderStageFlagBits stage, const uint32_t* code, size_t size) {
         VkShaderModule module = createShaderModule(device, code, size);
         modules.push_back(module);
@@ -154,6 +218,8 @@ VkPipeline MeshletRenderer::createPipeline(bool mesh, bool wireframe)
         info.stage = stage;
         info.module = module;
         info.pName = "main";
+        if (stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+            info.pSpecializationInfo = &specInfo;
         stages.push_back(info);
     };
 
@@ -161,7 +227,10 @@ VkPipeline MeshletRenderer::createPipeline(bool mesh, bool wireframe)
     {
         addStage(VK_SHADER_STAGE_TASK_BIT_EXT, kMeshletTaskSpv, sizeof(kMeshletTaskSpv));
         addStage(VK_SHADER_STAGE_MESH_BIT_EXT, kMeshletMeshSpv, sizeof(kMeshletMeshSpv));
-        addStage(VK_SHADER_STAGE_FRAGMENT_BIT, kMeshletFragMeshSpv, sizeof(kMeshletFragMeshSpv));
+        if (ctx->caps.barycentric)
+            addStage(VK_SHADER_STAGE_FRAGMENT_BIT, kMeshletFragMeshSpv, sizeof(kMeshletFragMeshSpv));
+        else
+            addStage(VK_SHADER_STAGE_FRAGMENT_BIT, kMeshletFragMeshNoBarySpv, sizeof(kMeshletFragMeshNoBarySpv));
     }
     else
     {
@@ -178,20 +247,17 @@ VkPipeline MeshletRenderer::createPipeline(bool mesh, bool wireframe)
     viewport.scissorCount = 1;
 
     VkPipelineRasterizationStateCreateInfo raster = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-    raster.polygonMode = wireframe ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+    raster.polygonMode = VK_POLYGON_MODE_FILL; // wireframe is drawn in the fragment shader
     raster.cullMode = VK_CULL_MODE_NONE; // scanned models often have inconsistent winding
     raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.f;
-    raster.depthBiasEnable = wireframe ? VK_TRUE : VK_FALSE;
-    raster.depthBiasConstantFactor = 1.f; // reversed-Z: positive bias pulls lines towards the camera
-    raster.depthBiasSlopeFactor = 1.f;
 
     VkPipelineMultisampleStateCreateInfo multisample = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
     VkPipelineDepthStencilStateCreateInfo depth = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = wireframe ? VK_FALSE : VK_TRUE;
+    depth.depthWriteEnable = VK_TRUE;
     depth.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL; // reversed-Z
 
     VkPipelineColorBlendAttachmentState blendAttachment = {};
@@ -323,7 +389,18 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     globals.meshletCount = meshletCount;
     globals.mode = uint32_t(params.mode);
     globals.highlight = params.highlight;
-    globals.flags = (params.frustumCull ? 1u : 0u) | (params.coneCull ? 2u : 0u);
+    const bool wireframe = params.wireframe && params.wireWidth > 0.f && supportsWireframe();
+    globals.flags = (params.frustumCull ? 1u : 0u) | (params.coneCull ? 2u : 0u) | (wireframe ? 4u : 0u);
+    globals.wireWidth = params.wireWidth;
+    globals.matcap = params.matcap >= 0 && size_t(params.matcap) < matcapNames.size() ? params.matcap : -1;
+    const vec3 basis[3] = {params.viewRight, params.viewUp, params.viewBack};
+    float* basisOut[3] = {globals.viewRight, globals.viewUp, globals.viewBack};
+    for (int i = 0; i < 3; ++i)
+    {
+        basisOut[i][0] = basis[i].x;
+        basisOut[i][1] = basis[i].y;
+        basisOut[i][2] = basis[i].z;
+    }
     std::memcpy(frame.globals.mapped, &globals, sizeof(globals));
 
     GpuStats zero = {};
@@ -390,30 +467,14 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
 
     const uint32_t taskGroups = (meshletCount + kTaskGroupSize - 1) / kTaskGroupSize;
 
-    auto drawPass = [&](VkPipeline pipeline, uint32_t pass) {
-        if (!pipeline)
-            return;
-        push.pass = pass;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
-        if (usesMeshShaders())
-            vkCmdDrawMeshTasksEXT(cmd, taskGroups, 1, 1);
-        else
-            vkCmdDraw(cmd, triangleCount * 3, 1, 0, 0);
-    };
-
+    // Single pass: the wireframe (if enabled) is composited in the fragment shader.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, usesMeshShaders() ? meshPipeline : vertexPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &descriptorSet, 0, nullptr);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
     if (usesMeshShaders())
-    {
-        drawPass(meshPipeline, 0);
-        if (params.wireframe)
-            drawPass(meshWirePipeline, 1);
-    }
+        vkCmdDrawMeshTasksEXT(cmd, taskGroups, 1, 1);
     else
-    {
-        drawPass(vertexPipeline, 0);
-        if (params.wireframe)
-            drawPass(vertexWirePipeline, 1);
-    }
+        vkCmdDraw(cmd, triangleCount * 3, 1, 0, 0);
 }
 
 void MeshletRenderer::end(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t imageIndex)

@@ -47,7 +47,7 @@ void main()
     }
     barrier();
 
-    if (gl_LocalInvocationIndex == 0 && pc.pass == 0u && visibleCount > 0u)
+    if (gl_LocalInvocationIndex == 0 && visibleCount > 0u)
         atomicAdd(pc.stats.visibleMeshlets, visibleCount);
 
     EmitMeshTasksEXT(visibleCount, 1, 1);

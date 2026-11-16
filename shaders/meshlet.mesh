@@ -11,6 +11,9 @@ taskPayloadSharedEXT uint payloadMeshlets[TASK_GROUP_SIZE];
 layout(location = 0) out vec3 outNormal[];
 layout(location = 1) out vec3 outWorldPos[];
 layout(location = 2) perprimitiveEXT flat out uint outMeshletTriangle[];
+layout(location = 3) perprimitiveEXT flat out vec3 outAltitudes[];
+
+shared vec3 sharedPositions[MAX_MESHLET_VERTICES];
 
 uint readTriangleByte(uint byteIndex)
 {
@@ -32,15 +35,20 @@ void main()
         gl_MeshVerticesEXT[i].gl_Position = viewProj * vec4(p, 1.0);
         outNormal[i] = vec3(v.nx, v.ny, v.nz);
         outWorldPos[i] = p;
+        sharedPositions[i] = p;
     }
+
+    barrier(); // sharedPositions complete before triangles read them
 
     for (uint t = gl_LocalInvocationIndex; t < m.triangleCount; t += MESH_GROUP_SIZE)
     {
         uint base = m.triangleOffset + t * 3u;
-        gl_PrimitiveTriangleIndicesEXT[t] = uvec3(readTriangleByte(base), readTriangleByte(base + 1u), readTriangleByte(base + 2u));
+        uvec3 tri = uvec3(readTriangleByte(base), readTriangleByte(base + 1u), readTriangleByte(base + 2u));
+        gl_PrimitiveTriangleIndicesEXT[t] = tri;
         outMeshletTriangle[t] = (mi << TRI_BITS) | t;
+        outAltitudes[t] = triangleAltitudes(sharedPositions[tri.x], sharedPositions[tri.y], sharedPositions[tri.z]);
     }
 
-    if (gl_LocalInvocationIndex == 0 && pc.pass == 0u)
+    if (gl_LocalInvocationIndex == 0)
         atomicAdd(pc.stats.visibleTriangles, m.triangleCount);
 }

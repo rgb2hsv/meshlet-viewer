@@ -12,6 +12,7 @@
 
 #define FLAG_FRUSTUM_CULL 1u
 #define FLAG_CONE_CULL 2u
+#define FLAG_WIREFRAME 4u
 
 #define MODE_MESHLET 0u
 #define MODE_TRIANGLE 1u
@@ -58,6 +59,12 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Gl
     uint mode;
     int highlight;    // -1 = none
     uint flags;
+    float wireWidth;  // wireframe line width in model units
+    int matcap;       // index into matcaps[], -1 = plain lighting
+    float pad0, pad1;
+    vec4 viewRight;   // camera basis in world space (view-space x, y, z)
+    vec4 viewUp;
+    vec4 viewBack;
 };
 
 layout(push_constant) uniform PushConstants
@@ -71,8 +78,16 @@ layout(push_constant) uniform PushConstants
     UintBuffer fallbackIndices;   // vertex path: global vertex index per corner
     UintBuffer fallbackTriangles; // vertex path: packed meshlet/triangle id per triangle
     StatsBuffer stats;
-    uint pass;                    // 0 = solid, 1 = wireframe overlay
 } pc;
+
+// Altitudes of triangle (a, b, c): distance from each vertex to its opposite edge.
+// barycentric[i] * altitude[i] is then the in-plane distance to edge i, in model units.
+vec3 triangleAltitudes(vec3 a, vec3 b, vec3 c)
+{
+    float doubleArea = length(cross(b - a, c - a));
+    vec3 edgeLengths = vec3(length(c - b), length(a - c), length(b - a)); // edge opposite a, b, c
+    return doubleArea / max(edgeLengths, vec3(1e-30));
+}
 
 uint hash(uint x)
 {
