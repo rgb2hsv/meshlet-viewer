@@ -1,0 +1,13 @@
+title: Meshlets
+description: How the meshlets viewer turns a triangle mesh into GPU-ready clusters and a cluster LOD hierarchy.
+baseurl: /meshlets
+repository: rgb2hsv/meshlets
+
+markdown: kramdown
+kramdown:
+  input: GFM
+  math_engine: mathjax
+  syntax_highlighter: rouge
+
+exclude:
+  - _figures

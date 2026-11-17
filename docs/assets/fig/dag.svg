@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 380" width="760" height="380" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="13">
+<rect width="760" height="380" fill="#ffffff"/>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5c6370"/></marker></defs>
+<rect x="28.9" y="322" width="177.2" height="46" rx="10" fill="none" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="5 3"/>
+<text x="117.5" y="316" font-size="11" font-weight="600" text-anchor="middle" fill="#c0392b">group error 3.1 px</text>
+<line x1="117.5" y1="308" x2="73.8" y2="267" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="117.5" y1="308" x2="161.2" y2="267" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="203.9" y="322" width="177.2" height="46" rx="10" fill="none" stroke="#27ae60" stroke-width="1.6" stroke-dasharray="5 3"/>
+<text x="292.5" y="316" font-size="11" font-weight="600" text-anchor="middle" fill="#27ae60">group error 0.6 px</text>
+<line x1="292.5" y1="308" x2="248.8" y2="267" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="292.5" y1="308" x2="336.2" y2="267" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="378.9" y="322" width="177.2" height="46" rx="10" fill="none" stroke="#27ae60" stroke-width="1.6" stroke-dasharray="5 3"/>
+<text x="467.5" y="316" font-size="11" font-weight="600" text-anchor="middle" fill="#27ae60">group error 0.5 px</text>
+<line x1="467.5" y1="308" x2="423.8" y2="267" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="467.5" y1="308" x2="511.2" y2="267" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="553.9" y="322" width="177.2" height="46" rx="10" fill="none" stroke="#27ae60" stroke-width="1.6" stroke-dasharray="5 3"/>
+<text x="642.5" y="316" font-size="11" font-weight="600" text-anchor="middle" fill="#27ae60">group error 0.7 px</text>
+<line x1="642.5" y1="308" x2="598.8" y2="267" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="642.5" y1="308" x2="686.2" y2="267" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="50.8" y="227" width="308.5" height="46" rx="10" fill="none" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="5 3"/>
+<text x="205.0" y="221" font-size="11" font-weight="600" text-anchor="middle" fill="#c0392b">group error 4.0 px</text>
+<line x1="205.0" y1="213" x2="117.5" y2="172" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="205.0" y1="213" x2="292.5" y2="172" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="400.8" y="227" width="308.5" height="46" rx="10" fill="none" stroke="#27ae60" stroke-width="1.6" stroke-dasharray="5 3"/>
+<text x="555.0" y="221" font-size="11" font-weight="600" text-anchor="middle" fill="#27ae60">group error 0.9 px</text>
+<line x1="555.0" y1="213" x2="467.5" y2="172" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="555.0" y1="213" x2="642.5" y2="172" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="94.5" y="132" width="571.0" height="46" rx="10" fill="none" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="5 3"/>
+<text x="380.0" y="126" font-size="11" font-weight="600" text-anchor="middle" fill="#c0392b">group error 6.5 px</text>
+<line x1="380.0" y1="118" x2="205.0" y2="77" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<line x1="380.0" y1="118" x2="555.0" y2="77" stroke="#9aa3b2" stroke-width="1.2" marker-end="url(#arrow)"/>
+<rect x="182.0" y="37" width="396.0" height="46" rx="10" fill="none" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="5 3"/>
+<text x="380.0" y="31" font-size="11" font-weight="600" text-anchor="middle" fill="#c0392b">group error ∞ px</text>
+<rect x="36.9" y="330" width="30" height="30" rx="5" fill="#3a6fd8" stroke="#1d1d1f" stroke-width="1.6"/>
+<rect x="80.6" y="330" width="30" height="30" rx="5" fill="#3a6fd8" stroke="#1d1d1f" stroke-width="1.6"/>
+<rect x="124.4" y="330" width="30" height="30" rx="5" fill="#3a6fd8" stroke="#1d1d1f" stroke-width="1.6"/>
+<rect x="168.1" y="330" width="30" height="30" rx="5" fill="#3a6fd8" stroke="#1d1d1f" stroke-width="1.6"/>
+<rect x="211.9" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="255.6" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="299.4" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="343.1" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="386.9" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="430.6" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="474.4" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="518.1" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="561.9" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="605.6" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="649.4" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="693.1" y="330" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<text x="8" y="350" font-size="12" font-weight="700" text-anchor="start" fill="#3a6fd8">L0</text>
+<rect x="58.8" y="235" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="146.2" y="235" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="233.8" y="235" width="30" height="30" rx="5" fill="#2fa3a8" stroke="#1d1d1f" stroke-width="1.6"/>
+<rect x="321.2" y="235" width="30" height="30" rx="5" fill="#2fa3a8" stroke="#1d1d1f" stroke-width="1.6"/>
+<rect x="408.8" y="235" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="496.2" y="235" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="583.8" y="235" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="671.2" y="235" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<text x="8" y="255" font-size="12" font-weight="700" text-anchor="start" fill="#2fa3a8">L1</text>
+<rect x="102.5" y="140" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="277.5" y="140" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="452.5" y="140" width="30" height="30" rx="5" fill="#7cbf6a" stroke="#1d1d1f" stroke-width="1.6"/>
+<rect x="627.5" y="140" width="30" height="30" rx="5" fill="#7cbf6a" stroke="#1d1d1f" stroke-width="1.6"/>
+<text x="8" y="160" font-size="12" font-weight="700" text-anchor="start" fill="#7cbf6a">L2</text>
+<rect x="190.0" y="45" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<rect x="540.0" y="45" width="30" height="30" rx="5" fill="#e6e8ee" stroke="#b8bdc8" stroke-width="1"/>
+<text x="8" y="65" font-size="12" font-weight="700" text-anchor="start" fill="#e8a33d">L3</text>
+<text x="740" y="30" font-size="12" font-weight="700" text-anchor="end" fill="#1d1d1f">threshold: 1 px</text>
+<text x="740" y="48" font-size="11.5" font-weight="400" text-anchor="end" fill="#555">filled = drawn this frame</text>
+</svg>
