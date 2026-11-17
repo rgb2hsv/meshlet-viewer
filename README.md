@@ -5,6 +5,8 @@ Interactive meshlet viewer: loads a PLY/OBJ model, splits it into meshlets with
 shaders (`VK_EXT_mesh_shader`), with a vertex-shader fallback for GPUs without them.
 The UI is a Dear ImGui sidebar on the left (on GLFW); drag its right edge to resize it.
 
+![The meshlets viewer showing metasphere.ply as a cluster LOD cut, with meshlet outlines and the LOD sidebar](docs/assets/img/screenshot.webp)
+
 - Task shader: per-meshlet frustum and normal-cone (backface) culling
 - Mesh shader: one workgroup per meshlet, up to 256 vertices / 256 triangles
 - Meshlets colored with a gradient by LOD level (blue = full detail to orange = coarsest), or by
