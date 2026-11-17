@@ -1,7 +1,7 @@
 # meshlets
 
 Interactive meshlet viewer: loads a PLY/OBJ model, splits it into meshlets with
-[meshoptimizer](external/meshoptimizer), and renders them with Vulkan task + mesh
+[meshoptimizer](https://github.com/zeux/meshoptimizer), and renders them with Vulkan task + mesh
 shaders (`VK_EXT_mesh_shader`), with a vertex-shader fallback for GPUs without them.
 The UI is a Dear ImGui sidebar on the left (on GLFW); drag its right edge to resize it.
 
