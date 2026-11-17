@@ -770,14 +770,58 @@ bool loadModel(const std::string& path, Model& model, std::string& error, bool o
         model.boundsMin[k] = INFINITY;
         model.boundsMax[k] = -INFINITY;
     }
-    for (const Vertex& v : model.vertices)
+    // bounds over vertices the triangles use (files can carry stray unreferenced points)
+    std::vector<uint8_t> referenced(model.vertices.size(), 0);
+    for (uint32_t index : model.indices)
+        referenced[index] = 1;
+    for (size_t i = 0; i < model.vertices.size(); ++i)
     {
+        if (!referenced[i])
+            continue;
+        const Vertex& v = model.vertices[i];
         const float p[3] = {v.px, v.py, v.pz};
         for (int k = 0; k < 3; ++k)
         {
             model.boundsMin[k] = std::min(model.boundsMin[k], p[k]);
             model.boundsMax[k] = std::max(model.boundsMax[k], p[k]);
         }
+    }
+    if (model.indices.empty())
+        for (int k = 0; k < 3; ++k)
+            model.boundsMin[k] = model.boundsMax[k] = 0;
+
+    // object center: area-weighted centroid of the triangles (falls back to the box center)
+    {
+        double sum[3] = {0, 0, 0}, totalArea = 0;
+        for (size_t t = 0; t + 2 < model.indices.size(); t += 3)
+        {
+            const Vertex& a = model.vertices[model.indices[t + 0]];
+            const Vertex& b = model.vertices[model.indices[t + 1]];
+            const Vertex& c = model.vertices[model.indices[t + 2]];
+            const double e1[3] = {double(b.px) - a.px, double(b.py) - a.py, double(b.pz) - a.pz};
+            const double e2[3] = {double(c.px) - a.px, double(c.py) - a.py, double(c.pz) - a.pz};
+            const double cx = e1[1] * e2[2] - e1[2] * e2[1];
+            const double cy = e1[2] * e2[0] - e1[0] * e2[2];
+            const double cz = e1[0] * e2[1] - e1[1] * e2[0];
+            const double area = 0.5 * std::sqrt(cx * cx + cy * cy + cz * cz);
+            sum[0] += area * (double(a.px) + b.px + c.px) / 3.0;
+            sum[1] += area * (double(a.py) + b.py + c.py) / 3.0;
+            sum[2] += area * (double(a.pz) + b.pz + c.pz) / 3.0;
+            totalArea += area;
+        }
+        for (int k = 0; k < 3; ++k)
+            model.center[k] = totalArea > 0 ? float(sum[k] / totalArea) : (model.boundsMin[k] + model.boundsMax[k]) * 0.5f;
+
+        double r2 = 0;
+        for (size_t i = 0; i < model.vertices.size(); ++i)
+        {
+            if (!referenced[i])
+                continue;
+            const Vertex& v = model.vertices[i];
+            const double d[3] = {double(v.px) - model.center[0], double(v.py) - model.center[1], double(v.pz) - model.center[2]};
+            r2 = std::max(r2, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        }
+        model.radius = float(std::sqrt(r2));
     }
 
     // average edge length over (up to) ~1M evenly sampled triangles

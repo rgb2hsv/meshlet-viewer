@@ -60,6 +60,7 @@ static_assert(offsetof(GpuGlobals, lodNodes) == 272, "GpuGlobals layout mismatch
 constexpr uint32_t kMaxBvhDepth = 64;    // MAX_BVH_DEPTH in common.glsl
 constexpr uint32_t kBvhGroupSize = 64;   // BVH_GROUP_SIZE
 constexpr uint32_t kFlagLodCandidates = 8; // FLAG_LOD_CANDIDATES
+constexpr uint32_t kFlagPreview = 16;      // FLAG_PREVIEW
 
 // Must match TraversalBuffer in shaders/common.glsl
 struct GpuTraversal
@@ -252,8 +253,8 @@ void MeshletRenderer::createPipelines()
             vkDestroyShaderModule(ctx->device, module, nullptr);
         }
     }
-    else
-        vertexPipeline = createPipeline(false);
+    // the vertex pipeline is the fallback without mesh shaders and draws the preview on every GPU
+    vertexPipeline = createPipeline(false);
 }
 
 VkPipeline MeshletRenderer::createPipeline(bool mesh)
@@ -427,6 +428,20 @@ void MeshletRenderer::upload(const Model& model, const MeshletData& data)
                         fallbackIndices.size + fallbackTriangles.size);
 }
 
+void MeshletRenderer::uploadPreview(const Model& model)
+{
+    VK_CHECK(vkDeviceWaitIdle(ctx->device));
+    releaseScene();
+    if (model.indices.empty())
+        return;
+    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    vertices = ctx->createDeviceBuffer(model.vertices.data(), model.vertices.size() * sizeof(Vertex), usage);
+    fallbackIndices = ctx->createDeviceBuffer(model.indices.data(), model.indices.size() * sizeof(uint32_t), usage);
+    previewTriangleCount = uint32_t(model.indices.size() / 3);
+    triangleCount = previewTriangleCount;
+    sceneBytes = size_t(vertices.size + fallbackIndices.size);
+}
+
 void MeshletRenderer::releaseScene()
 {
     if (!ctx)
@@ -441,7 +456,7 @@ void MeshletRenderer::releaseScene()
             ctx->destroyBuffer(*buffer);
     lodRootCount = 0;
     lodNodesPerDepth.clear();
-    meshletCount = triangleCount = 0;
+    meshletCount = triangleCount = previewTriangleCount = 0;
     fallbackClusters = fallbackTriangleCount = 0;
     sceneBytes = 0;
 }
@@ -500,6 +515,14 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     Eigen::Map<Eigen::Vector3f>(globals.viewUp) = params.viewUp;
     Eigen::Map<Eigen::Vector3f>(globals.viewBack) = params.viewBack;
 
+    if (previewing())
+    {
+        // raw mesh: matcap shaded (plain lighting with --matcap none), no wireframe, culling or LOD
+        globals.mode = uint32_t(ColorMode::Shaded);
+        globals.highlight = -1;
+        globals.flags = kFlagPreview;
+    }
+
     Eigen::Map<Eigen::Vector3f>(globals.lodCamera) = params.cullCameraPos;
     globals.lodCamera[3] = params.zNear;
     globals.lodScale = params.lodScale;
@@ -525,7 +548,9 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     std::memcpy(frame.globals.mapped, &globals, sizeof(globals));
 
     GpuStats zero = {};
-    if (!usesMeshShaders())
+    if (previewing())
+        zero.visibleTriangles = zero.levelTriangles[0] = previewTriangleCount;
+    else if (!usesMeshShaders())
     {
         // no culling or LOD in the fallback path: level 0 is always drawn in full
         zero.visibleMeshlets = zero.levelClusters[0] = fallbackClusters;
@@ -619,6 +644,14 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+    if (previewing())
+    {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vertexPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_ALL, 0, sizeof(push), &push);
+        vkCmdDraw(cmd, previewTriangleCount * 3, 1, 0, 0);
+        return;
+    }
     if (meshletCount == 0)
         return;
 
