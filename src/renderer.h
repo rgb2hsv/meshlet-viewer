@@ -65,8 +65,12 @@ public:
 
     // Uploads model + meshlets to the GPU (blocks; waits for the device to be idle first).
     void upload(const Model& model, const MeshletData& meshlets);
+    // Uploads only the triangles, drawn matcap shaded without wireframe until upload() replaces them
+    // (shown while the meshlets of a newly loaded model are being built).
+    void uploadPreview(const Model& model);
     void releaseScene();
-    bool hasScene() const { return meshletCount > 0; }
+    bool hasScene() const { return meshletCount > 0 || previewTriangleCount > 0; }
+    bool previewing() const { return previewTriangleCount > 0; }
     bool usesMeshShaders() const { return meshPipeline != VK_NULL_HANDLE; }
     // Cluster LOD selection runs in the task shader; the vertex fallback draws level 0 only.
     bool supportsLod() const { return usesMeshShaders(); }
@@ -135,6 +139,7 @@ private:
     uint32_t lodRootCount = 0;
     std::vector<uint32_t> lodNodesPerDepth;
     Buffer fallbackIndices, fallbackTriangles;
+    uint32_t previewTriangleCount = 0; // > 0: drawing the raw mesh (fallbackIndices = model indices)
     uint32_t fallbackClusters = 0;  // fallback draws level 0 only
     uint32_t fallbackTriangleCount = 0;
     uint32_t meshletCount = 0;

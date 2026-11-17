@@ -28,8 +28,16 @@ void main()
     gl_Position = pc.globals.viewProj * vec4(p, 1.0);
     outNormal = vec3(v.nx, v.ny, v.nz);
     outWorldPos = p;
-    outMeshletTriangle = pc.fallbackTriangles.d[gl_VertexIndex / 3];
     outBarycentric = vec3(corner == 0u, corner == 1u, corner == 2u);
+    if ((pc.globals.flags & FLAG_PREVIEW) != 0u)
+    {
+        // raw mesh while meshlets build: no meshlet ids or edge masks exist yet
+        outMeshletTriangle = 0u;
+        outEdgeMask = 0u;
+        outAltitudes = vec3(0.0);
+        return;
+    }
+    outMeshletTriangle = pc.fallbackTriangles.d[gl_VertexIndex / 3];
     uint triangle = uint(gl_VertexIndex) / 3u; // fallback: edge masks are stored per drawn triangle
     outEdgeMask = (pc.edgeMasks.d[triangle >> 2] >> ((triangle & 3u) * 8u)) & 7u;
     outAltitudes = (pc.globals.flags & FLAG_WIREFRAME) != 0u

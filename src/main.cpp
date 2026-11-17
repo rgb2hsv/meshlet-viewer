@@ -13,11 +13,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cfloat>
 #include <cstring>
 #include <future>
 #include <memory>
+#include <optional>
 #include <string>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include <stb_image_write.h>
 
 namespace
 {
@@ -95,10 +100,9 @@ struct Camera
 
     void frame(const Model& model)
     {
-        const Eigen::Vector3f lo(model.boundsMin[0], model.boundsMin[1], model.boundsMin[2]);
-        const Eigen::Vector3f hi(model.boundsMax[0], model.boundsMax[1], model.boundsMax[2]);
-        target = (lo + hi) * 0.5f;
-        radius = std::max((hi - lo).norm() * 0.5f, 1e-6f);
+        // orbit about the object's centroid; radius is the sphere around it that holds the whole object
+        target = Eigen::Vector3f(model.center[0], model.center[1], model.center[2]);
+        radius = std::max(model.radius, 1e-6f);
         distance = radius / std::sin(fovY * 0.5f) * 1.05f;
     }
 
@@ -118,7 +122,7 @@ struct Camera
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left) && !io.KeyShift)
         {
             yaw -= dx * 0.005f;
-            pitch = std::clamp(pitch + dy * 0.005f, -1.55f, 1.55f);
+            pitch = std::clamp(pitch + dy * 0.005f, -kMaxPitch, kMaxPitch);
         }
         if (ImGui::IsMouseDown(ImGuiMouseButton_Middle) || (ImGui::IsMouseDown(ImGuiMouseButton_Left) && io.KeyShift))
         {
@@ -133,6 +137,28 @@ struct Camera
         if (io.MouseWheel != 0)
             distance *= std::exp(-io.MouseWheel * 0.1f);
         distance = std::clamp(distance, radius * 0.001f, radius * 100.f);
+    }
+
+    static constexpr float kMaxPitch = 1.55f; // radians; keeps the view off the poles
+
+    // Orbit so the eye sits at `position` (keeps the target)
+    void setEye(const Eigen::Vector3f& position)
+    {
+        const Eigen::Vector3f d = position - target;
+        distance = std::max(d.norm(), 1e-6f);
+        const Eigen::Vector3f n = d / distance;
+        pitch = std::clamp(std::asin(std::clamp(zUp ? n.z() : n.y(), -1.f, 1.f)), -kMaxPitch, kMaxPitch);
+        yaw = zUp ? std::atan2(n.y(), n.x()) : std::atan2(n.x(), n.z());
+    }
+
+    // The current pose as command line arguments
+    std::string cliArgs() const
+    {
+        constexpr float kDeg = float(180.0 / M_PI);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "--yaw %.6g --pitch %.6g --distance %.6g --target %.6g %.6g %.6g --fov %.6g%s", yaw * kDeg,
+            pitch * kDeg, distance, target.x(), target.y(), target.z(), fovY * kDeg, zUp ? " --z-up" : "");
+        return buf;
     }
 };
 
@@ -159,6 +185,10 @@ struct App
     bool autoRebuild = true;
     bool rebuildPending = false;
     float initialZoom = 1.f;
+    // camera pose from the command line, applied when the first model has loaded
+    std::optional<Eigen::Vector3f> initialTarget, initialEye;
+    std::optional<float> initialDistance;
+    bool showUi = true; // false (--no-ui): no sidebar, the 3D view fills the window
     float wireWidthOverride = 0.f;    // from --wire-width; 0 = automatic
     float outlineWidthOverride = 0.f; // from --outline-width; 0 = automatic
     static constexpr float kAutoWireFraction = 0.05f;    // triangle lines: 5% of the average edge
@@ -190,10 +220,29 @@ struct App
     void resetRotation(const Model& m)
     {
         objectRotation = Eigen::Quaternionf::Identity();
-        rotationCenter = Eigen::Vector3f(m.boundsMin[0] + m.boundsMax[0], m.boundsMin[1] + m.boundsMax[1], m.boundsMin[2] + m.boundsMax[2]) * 0.5f;
+        rotationCenter = Eigen::Vector3f(m.center[0], m.center[1], m.center[2]);
     }
 
     bool freezeLod = false; // LOD selection + culling use a snapshot of the camera
+
+    // LOD sweep: steps the fixed level 0 -> coarsest -> 0, holding each level for lodSweepSeconds
+    bool lodSweep = false;
+    float lodSweepSeconds = 1.f;
+    float lodSweepPhase = 0.f; // in level steps, [0, 2 * (levels - 1))
+
+    void updateLodSweep(float dt)
+    {
+        if (!lodSweep || !meshlets || !meshlets->lod || !renderer.supportsLod())
+            return;
+        const int levels = int(meshlets->levelClusters.size());
+        if (levels < 2)
+            return;
+        const float period = float(2 * (levels - 1));
+        lodSweepPhase = std::fmod(lodSweepPhase + dt / std::max(lodSweepSeconds, 0.01f), period);
+        const int step = std::min(int(lodSweepPhase), 2 * (levels - 1) - 1);
+        draw.lodAuto = false;
+        draw.lodLevel = step < levels ? step : 2 * (levels - 1) - step;
+    }
     Eigen::Matrix4f frozenViewProj = Eigen::Matrix4f::Identity();
     Eigen::Vector3f frozenEye = Eigen::Vector3f::Zero();
     FrameStats stats;
@@ -207,18 +256,13 @@ struct App
         std::snprintf(pathInput, sizeof(pathInput), "%s", path.c_str());
         jobLabel = "Loading " + fileName(path);
         jobStart = Clock::now();
-        MeshletSettings s = settings;
         bool vcache = optimizeVertexCache;
-        job = std::async(std::launch::async, [path, s, vcache] {
+        // loads only; pollJob() shows the raw mesh and then starts building the meshlets
+        job = std::async(std::launch::async, [path, vcache] {
             JobResult result;
             auto loaded = std::make_shared<Model>();
-            if (!loadModel(path, *loaded, result.error, vcache))
-                return result;
-            auto built = std::make_shared<MeshletData>();
-            if (!buildMeshlets(*loaded, s, *built, result.error))
-                return result;
-            result.model = loaded;
-            result.meshlets = built;
+            if (loadModel(path, *loaded, result.error, vcache))
+                result.model = loaded;
             return result;
         });
     }
@@ -257,7 +301,7 @@ struct App
             status = result.error;
             statusIsError = true;
             std::fprintf(stderr, "error: %s\n", result.error.c_str());
-            loadFailed = !model;
+            loadFailed = !model || !meshlets;
         }
         else
         {
@@ -266,6 +310,15 @@ struct App
                 model = result.model;
                 camera.frame(*model);
                 camera.distance /= initialZoom;
+                if (firstLoad)
+                {
+                    if (initialTarget)
+                        camera.target = *initialTarget;
+                    if (initialDistance)
+                        camera.distance = *initialDistance;
+                    if (initialEye)
+                        camera.setEye(*initialEye);
+                }
                 resetRotation(*model);
                 draw.wireWidth = firstLoad && wireWidthOverride > 0.f ? wireWidthOverride : model->avgEdgeLength * kAutoWireFraction;
                 draw.outlineWidth =
@@ -275,6 +328,15 @@ struct App
                     draw.highlight = -1; // keep --highlight for the first model
                 firstLoad = false;
                 glfwSetWindowTitle(ctx.window, ("meshlets - " + fileName(model->path)).c_str());
+
+                // show the raw mesh (matcap shaded, no wireframe) while its meshlets are built
+                meshlets.reset();
+                renderer.uploadPreview(*model);
+                std::printf("%s: %zu vertices, %zu triangles, loaded in %.2fs\n", fileName(model->path).c_str(), model->vertices.size(),
+                    model->indices.size() / 3, model->loadSeconds);
+                std::fflush(stdout);
+                startBuild();
+                return;
             }
             meshlets = result.meshlets;
             draw.highlight = std::min(draw.highlight, int(meshlets->meshlets.size()) - 1);
@@ -333,7 +395,7 @@ void App::ui()
     // Left sidebar: docked, full height, scrolls vertically; the right edge can be dragged to resize
     const float height = io.DisplaySize.y;
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(kSidebarDefaultWidth, height), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(sidebarWidth, height), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSizeConstraints(ImVec2(kSidebarMinWidth, height), ImVec2(std::max(kSidebarMinWidth, io.DisplaySize.x * 0.6f), height));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.f);
@@ -380,6 +442,11 @@ void App::ui()
                 camera.frame(*model);
                 resetRotation(*model);
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Copy view args"))
+                ImGui::SetClipboardText(camera.cliArgs().c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Copy the camera pose as command line arguments:\n%s", camera.cliArgs().c_str());
 
             ImGui::Checkbox("Auto-rotate", &autoRotate);
             if (ImGui::IsItemHovered())
@@ -516,6 +583,21 @@ void App::ui()
         ImGui::SameLine();
         ImGui::RadioButton("Fixed level", &mode, 1);
         draw.lodAuto = mode == 0;
+        if (draw.lodAuto)
+            lodSweep = false;
+
+        if (ImGui::Checkbox("Sweep levels", &lodSweep) && lodSweep)
+        {
+            draw.lodAuto = false;
+            lodSweepPhase = float(std::clamp(draw.lodLevel, 0, levels - 1)); // continue from the current level
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Step through the levels, finest to coarsest and back");
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!lodSweep);
+        ImGui::SetNextItemWidth(-1);
+        ImGui::SliderFloat("##sweepseconds", &lodSweepSeconds, 0.1f, 5.f, "%.1f s per level", ImGuiSliderFlags_Logarithmic);
+        ImGui::EndDisabled();
 
         if (draw.lodAuto)
         {
@@ -526,7 +608,8 @@ void App::ui()
         else
         {
             draw.lodLevel = std::clamp(draw.lodLevel, 0, levels - 1);
-            ImGui::SliderInt("Level", &draw.lodLevel, 0, levels - 1);
+            if (ImGui::SliderInt("Level", &draw.lodLevel, 0, levels - 1) && lodSweep)
+                lodSweepPhase = float(draw.lodLevel); // dragging moves the sweep (it continues upward)
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Clusters of one DAG level, plus clusters below it that could not be simplified further");
         }
@@ -708,18 +791,31 @@ void App::ui()
     ImGui::End();
 }
 
-// Copies the swapchain image (in PRESENT_SRC layout) into a host buffer and writes a binary PPM.
-void saveScreenshot(VulkanContext& ctx, uint32_t imageIndex, const char* path)
+bool endsWith(const std::string& s, const char* suffix)
+{
+    const size_t n = std::strlen(suffix);
+    if (s.size() < n)
+        return false;
+    for (size_t i = 0; i < n; ++i)
+        if (std::tolower((unsigned char)s[s.size() - n + i]) != suffix[i])
+            return false;
+    return true;
+}
+
+// Copies the swapchain image (in PRESENT_SRC layout) into a host buffer and writes it as PNG (.png)
+// or binary PPM. Columns left of x0 are skipped (x0 = sidebar width crops to the 3D view).
+bool saveScreenshot(VulkanContext& ctx, uint32_t imageIndex, const std::string& path, uint32_t x0)
 {
     const Swapchain& sc = ctx.swapchain;
     if (!sc.canReadback)
     {
         std::fprintf(stderr, "screenshot: swapchain does not support TRANSFER_SRC\n");
-        return;
+        return false;
     }
     VK_CHECK(vkDeviceWaitIdle(ctx.device));
 
-    const uint32_t w = sc.extent.width, h = sc.extent.height;
+    x0 = std::min(x0, sc.extent.width - 1);
+    const uint32_t w = sc.extent.width - x0, h = sc.extent.height;
     Buffer readback = ctx.createBuffer(VkDeviceSize(w) * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
 
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -737,6 +833,7 @@ void saveScreenshot(VulkanContext& ctx, uint32_t imageIndex, const char* path)
         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
     VkBufferImageCopy region = {};
     region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {int32_t(x0), 0, 0};
     region.imageExtent = {w, h, 1};
     vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.buffer, 1, &region);
     transitionImage(cmd, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -751,23 +848,30 @@ void saveScreenshot(VulkanContext& ctx, uint32_t imageIndex, const char* path)
     vkFreeCommandBuffers(ctx.device, ctx.uploadPool, 1, &cmd);
 
     const bool bgra = sc.format == VK_FORMAT_B8G8R8A8_UNORM || sc.format == VK_FORMAT_B8G8R8A8_SRGB;
-    FILE* file = std::fopen(path, "wb");
-    if (file)
+    const uint8_t* pixels = static_cast<const uint8_t*>(readback.mapped);
+    std::vector<uint8_t> rgb(size_t(w) * h * 3);
+    for (size_t i = 0; i < size_t(w) * h; ++i)
     {
-        std::fprintf(file, "P6\n%u %u\n255\n", w, h);
-        const uint8_t* pixels = static_cast<const uint8_t*>(readback.mapped);
-        std::vector<uint8_t> rgb(size_t(w) * h * 3);
-        for (size_t i = 0; i < size_t(w) * h; ++i)
-        {
-            rgb[i * 3 + 0] = pixels[i * 4 + (bgra ? 2 : 0)];
-            rgb[i * 3 + 1] = pixels[i * 4 + 1];
-            rgb[i * 3 + 2] = pixels[i * 4 + (bgra ? 0 : 2)];
-        }
-        std::fwrite(rgb.data(), 1, rgb.size(), file);
-        std::fclose(file);
-        std::printf("screenshot saved to %s\n", path);
+        rgb[i * 3 + 0] = pixels[i * 4 + (bgra ? 2 : 0)];
+        rgb[i * 3 + 1] = pixels[i * 4 + 1];
+        rgb[i * 3 + 2] = pixels[i * 4 + (bgra ? 0 : 2)];
     }
     ctx.destroyBuffer(readback);
+
+    bool ok = false;
+    if (endsWith(path, ".png"))
+        ok = stbi_write_png(path.c_str(), int(w), int(h), 3, rgb.data(), int(w) * 3) != 0;
+    else if (FILE* file = std::fopen(path.c_str(), "wb"))
+    {
+        std::fprintf(file, "P6\n%u %u\n255\n", w, h);
+        ok = std::fwrite(rgb.data(), 1, rgb.size(), file) == rgb.size();
+        ok = std::fclose(file) == 0 && ok;
+    }
+    if (ok)
+        std::printf("screenshot saved to %s (%ux%u)\n", path.c_str(), w, h);
+    else
+        std::fprintf(stderr, "error: could not write screenshot %s\n", path.c_str());
+    return ok;
 }
 
 struct Options
@@ -787,13 +891,23 @@ struct Options
     bool coneCull = true;
     int highlight = -1;
     bool lodAuto = true;
+    bool lodSweep = false;
     float lodError = 1.f; // pixels
     int lodLevel = 0;
     float zoom = 1.f;
     bool autoRotate = false;
     float rotateSpeed = 30.f;
+    float background[3] = {0.08f, 0.09f, 0.11f};
+
+    // camera (angles in degrees; unset = framed on the model)
+    std::optional<float> yaw, pitch, distance;
+    std::optional<Eigen::Vector3f> target, eye;
+    float fov = 0.8f * float(180.0 / M_PI);
 
     bool noMeshShaders = false;
+    bool showUi = true;
+    float sidebarWidth = 400.f;
+    bool screenshotPane = false;
     bool validation = false;
     int width = 1600, height = 1000;
     int frames = 0;
@@ -835,6 +949,7 @@ bool parseOptions(int argc, char** argv, Options& opt)
     program.add_argument("--lod-ratio").metavar("R").default_value(defaults.lodSimplifyRatio).nargs(1).scan<'g', float>().help("target triangle ratio per level [0.1, 0.9]");
     program.add_argument("--lod-partition").metavar("N").default_value(defaults.lodPartitionSize).nargs(1).scan<'i', int>().help("clusters per simplification group [2, 64]");
     program.add_argument("--lod-error").metavar("PX").default_value(1.f).nargs(1).scan<'g', float>().help("pixel error threshold for automatic LOD selection");
+    program.add_argument("--lod-sweep").flag().help("step the fixed level finest -> coarsest -> back, one level per second");
     program.add_argument("--lod-level").metavar("N").default_value(-1).nargs(1).scan<'i', int>().help("show a fixed DAG level instead of automatic selection");
 
     // ---- view ----
@@ -849,7 +964,17 @@ bool parseOptions(int argc, char** argv, Options& opt)
     program.add_argument("--highlight").metavar("INDEX").default_value(-1).nargs(1).scan<'i', int>().help("highlight one meshlet by index");
     program.add_argument("--auto-rotate").flag().help("turn the object about the screen's vertical axis");
     program.add_argument("--rotate-speed").metavar("DEG").default_value(30.f).nargs(1).scan<'g', float>().help("auto-rotate speed in degrees per second (negative: other direction)");
-    program.add_argument("--zoom").metavar("F").default_value(1.f).nargs(1).scan<'g', float>().help("initial camera zoom factor");
+    program.add_argument("--background").metavar("R G B").nargs(3).scan<'g', float>().help("R G B: background color, components in [0, 1]");
+
+    // ---- camera ----
+    program.add_group("Camera (orbits a target; the sidebar's \"Copy view args\" button prints the current pose)");
+    program.add_argument("--zoom").metavar("F").default_value(1.f).nargs(1).scan<'g', float>().help("initial camera zoom factor relative to the fitted view");
+    program.add_argument("--yaw").metavar("DEG").nargs(1).scan<'g', float>().help("orbit angle about the up axis [default: 34.4]");
+    program.add_argument("--pitch").metavar("DEG").nargs(1).scan<'g', float>().help("elevation above the horizon, in [-88.8, 88.8] [default: 17.2]");
+    program.add_argument("--distance").metavar("D").nargs(1).scan<'g', float>().help("eye to target distance in model units [default: fits the model]");
+    program.add_argument("--target").metavar("X Y Z").nargs(3).scan<'g', float>().help("X Y Z: point the camera orbits and looks at [default: the model's centroid]");
+    program.add_argument("--eye").metavar("X Y Z").nargs(3).scan<'g', float>().help("X Y Z: camera position (sets yaw, pitch and distance about the target)");
+    program.add_argument("--fov").metavar("DEG").nargs(1).scan<'g', float>().help("vertical field of view [default: 45.8]");
 
     // ---- app ----
     program.add_group("Application");
@@ -857,8 +982,11 @@ bool parseOptions(int argc, char** argv, Options& opt)
     program.add_argument("--validation").flag().help("enable VK_LAYER_KHRONOS_validation");
     program.add_argument("--width").metavar("PX").default_value(opt.width).nargs(1).scan<'i', int>().help("window width");
     program.add_argument("--height").metavar("PX").default_value(opt.height).nargs(1).scan<'i', int>().help("window height");
+    program.add_argument("--no-ui").flag().help("hide the sidebar; the 3D view fills the window");
+    program.add_argument("--sidebar-width").metavar("PX").default_value(400.f).nargs(1).scan<'g', float>().help("initial sidebar width (>= 300)");
     program.add_argument("--frames").metavar("N").default_value(0).nargs(1).scan<'i', int>().help("exit after N frames once the model is ready (0 = run until closed)");
-    program.add_argument("--screenshot").metavar("FILE.ppm").default_value(std::string()).nargs(1).help("save the last frame as PPM (use with --frames)");
+    program.add_argument("--screenshot").metavar("FILE").default_value(std::string()).nargs(1).help("save the last frame as .png (or PPM for any other extension); defaults --frames to 3");
+    program.add_argument("--screenshot-pane").flag().help("crop the screenshot to the 3D view right of the sidebar");
 
     auto fail = [&](const std::string& message) {
         std::fprintf(stderr, "error: %s\n\n%s", message.c_str(), program.usage().c_str());
@@ -907,7 +1035,10 @@ bool parseOptions(int argc, char** argv, Options& opt)
     m.lodPartitionSize = program.get<int>("--lod-partition");
     opt.lodError = program.get<float>("--lod-error");
     opt.lodLevel = program.get<int>("--lod-level");
-    opt.lodAuto = opt.lodLevel < 0;
+    opt.lodSweep = program.get<bool>("--lod-sweep");
+    opt.lodAuto = opt.lodLevel < 0 && !opt.lodSweep;
+    if (opt.lodSweep && (program.is_used("--lod-error") || program.is_used("--lod-level")))
+        return fail("--lod-sweep cannot be combined with --lod-error or --lod-level");
     opt.lodLevel = std::max(opt.lodLevel, 0);
     if (m.lodSimplifyRatio < 0.1f || m.lodSimplifyRatio > 0.9f)
         return fail("--lod-ratio must be in [0.1, 0.9]");
@@ -917,7 +1048,7 @@ bool parseOptions(int argc, char** argv, Options& opt)
         return fail("--lod-error must be > 0");
     if (program.is_used("--lod-error") && program.is_used("--lod-level"))
         return fail("--lod-error (automatic) and --lod-level (fixed) are mutually exclusive");
-    for (const char* name : {"--lod-spatial", "--lod-ratio", "--lod-partition", "--lod-error", "--lod-level"})
+    for (const char* name : {"--lod-spatial", "--lod-ratio", "--lod-partition", "--lod-error", "--lod-level", "--lod-sweep"})
         if (program.is_used(name) && !m.lod)
             std::fprintf(stderr, "warning: %s has no effect with --no-lod\n", name);
     if (m.lod && program.is_used("--algorithm"))
@@ -980,6 +1111,42 @@ bool parseOptions(int argc, char** argv, Options& opt)
         std::fprintf(stderr, "warning: --rotate-speed has no effect without --auto-rotate\n");
     if (opt.zoom <= 0.f)
         return fail("--zoom must be > 0");
+    if (program.is_used("--background"))
+    {
+        const std::vector<float> bg = program.get<std::vector<float>>("--background");
+        for (int k = 0; k < 3; ++k)
+            opt.background[k] = std::clamp(bg[size_t(k)], 0.f, 1.f);
+    }
+
+    // camera
+    auto vec3 = [&](const char* name) -> std::optional<Eigen::Vector3f> {
+        if (!program.is_used(name))
+            return std::nullopt;
+        const std::vector<float> v = program.get<std::vector<float>>(name);
+        return Eigen::Vector3f(v[0], v[1], v[2]);
+    };
+    if (program.is_used("--yaw"))
+        opt.yaw = program.get<float>("--yaw");
+    if (program.is_used("--pitch"))
+        opt.pitch = program.get<float>("--pitch");
+    if (program.is_used("--distance"))
+        opt.distance = program.get<float>("--distance");
+    opt.target = vec3("--target");
+    opt.eye = vec3("--eye");
+    if (program.is_used("--fov"))
+        opt.fov = program.get<float>("--fov");
+    if (opt.eye)
+        for (const char* name : {"--yaw", "--pitch", "--distance", "--zoom"})
+            if (program.is_used(name))
+                return fail(std::string("--eye and ") + name + " are mutually exclusive");
+    if (opt.distance && program.is_used("--zoom"))
+        return fail("--distance and --zoom are mutually exclusive");
+    if (opt.distance && *opt.distance <= 0.f)
+        return fail("--distance must be > 0");
+    if (opt.pitch && std::abs(*opt.pitch) > Camera::kMaxPitch * float(180.0 / M_PI))
+        std::fprintf(stderr, "warning: --pitch clamped to +/-%.1f degrees\n", Camera::kMaxPitch * float(180.0 / M_PI));
+    if (opt.fov <= 1.f || opt.fov >= 170.f)
+        return fail("--fov must be in (1, 170) degrees");
 
     // app
     opt.noMeshShaders = program.get<bool>("--no-mesh-shaders");
@@ -988,10 +1155,21 @@ bool parseOptions(int argc, char** argv, Options& opt)
     opt.height = program.get<int>("--height");
     opt.frames = std::max(0, program.get<int>("--frames"));
     opt.screenshot = program.get<std::string>("--screenshot");
+    opt.screenshotPane = program.get<bool>("--screenshot-pane");
+    opt.showUi = !program.get<bool>("--no-ui");
+    opt.sidebarWidth = program.get<float>("--sidebar-width");
     if (opt.width < 64 || opt.height < 64)
         return fail("--width/--height must be at least 64");
+    if (opt.sidebarWidth < 300.f)
+        return fail("--sidebar-width must be at least 300");
+    if (opt.sidebarWidth >= float(opt.width) * 0.6f)
+        return fail("--sidebar-width must be under 60% of --width");
+    if (program.is_used("--sidebar-width") && !opt.showUi)
+        std::fprintf(stderr, "warning: --sidebar-width has no effect with --no-ui\n");
+    if (opt.screenshotPane && opt.screenshot.empty())
+        return fail("--screenshot-pane requires --screenshot FILE");
     if (!opt.screenshot.empty() && opt.frames == 0)
-        return fail("--screenshot requires --frames N");
+        opt.frames = 3; // a few frames so the LOD selection and stats settle
     return true;
 }
 
@@ -1079,7 +1257,20 @@ int main(int argc, char** argv)
     app->draw.lodAuto = opt.lodAuto;
     app->draw.lodThreshold = opt.lodError;
     app->draw.lodLevel = opt.lodLevel;
+    app->lodSweep = opt.lodSweep;
     app->initialZoom = opt.zoom;
+    constexpr float kRad = float(M_PI / 180.0);
+    if (opt.yaw)
+        app->camera.yaw = *opt.yaw * kRad;
+    if (opt.pitch)
+        app->camera.pitch = std::clamp(*opt.pitch * kRad, -Camera::kMaxPitch, Camera::kMaxPitch);
+    app->camera.fovY = opt.fov * kRad;
+    app->initialTarget = opt.target;
+    app->initialEye = opt.eye;
+    app->initialDistance = opt.distance;
+    std::copy(opt.background, opt.background + 3, app->draw.clearColor);
+    app->showUi = opt.showUi;
+    app->sidebarWidth = opt.sidebarWidth;
     app->autoRotate = opt.autoRotate;
     app->rotateSpeed = opt.rotateSpeed;
 
@@ -1182,7 +1373,11 @@ int main(int argc, char** argv)
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         app->camera.update(ImGui::GetIO());
-        app->ui();
+        app->updateLodSweep(ImGui::GetIO().DeltaTime);
+        if (app->showUi)
+            app->ui();
+        else
+            app->sidebarWidth = 0.f;
         ImGui::Render();
 
         uint32_t imageIndex = 0;
@@ -1274,7 +1469,10 @@ int main(int argc, char** argv)
         {
             // Read back from the image before handing it to the presentation engine.
             // The image is in PRESENT_SRC layout and rendering is complete (queue idle).
-            saveScreenshot(ctx, imageIndex, screenshotPath.c_str());
+            // --screenshot-pane crops to the 3D view, the same columns the renderer's viewport covers.
+            const uint32_t x0 = opt.screenshotPane ? uint32_t(std::floor(app->draw.viewportX)) : 0u;
+            if (!saveScreenshot(ctx, imageIndex, screenshotPath, x0))
+                exitCode = 1;
         }
 
         VkResult present = vkQueuePresentKHR(ctx.queue, &presentInfo);

@@ -14,6 +14,7 @@
 #define FLAG_CONE_CULL 2u
 #define FLAG_WIREFRAME 4u
 #define FLAG_LOD_CANDIDATES 8u // task shader reads the BVH-selected cluster list instead of all clusters
+#define FLAG_PREVIEW 16u       // vertex path draws the raw index buffer (no meshlets yet): no per-triangle ids or edge masks
 
 #define MODE_MESHLET 0u
 #define MODE_TRIANGLE 1u

@@ -48,6 +48,7 @@ cmake --build build
 ./build/meshlets --no-lod -a flex --max-vertices 128 --max-triangles 128 --min-triangles 64
 ./build/meshlets -c shaded --matcap metal_carpaint --outline-width 0.3 --wire-width 0.05
 ./build/meshlets --lod-error 2          # coarser cut (or --lod-level N for a fixed level)
+./build/meshlets --lod-sweep           # step through the levels and back ("Sweep levels" in the sidebar)
 ./build/meshlets --help                # all options
 ```
 
@@ -55,9 +56,24 @@ Mouse: left-drag to orbit, Shift+left-drag or middle-drag to pan, right-drag or 
 wheel to zoom. "Auto-rotate" (or `--auto-rotate`, `--rotate-speed DEG`) turns the object about
 the screen's vertical axis through its center. You can also drop a `.ply`/`.obj` file onto the window to load it.
 
-Batch use: `--frames N --screenshot out.ppm` renders N frames after loading,
-saves the last frame and exits. A one-line meshlet summary is printed to stdout
-after every build.
+While a model's meshlets are being built, the raw mesh is shown matcap shaded without the wireframe.
+
+Batch use: `--screenshot out.png` renders a few frames once the meshlets are built
+(`--frames N` to choose how many), saves the last one and exits. `.png` writes PNG, any other
+extension binary PPM. `--screenshot-pane` crops it to the 3D view right of the sidebar, and
+`--no-ui` hides the sidebar so the view fills the window. A one-line meshlet summary is printed
+to stdout after every build.
+
+The camera pose can be set from the command line: `--yaw DEG`, `--pitch DEG`, `--distance D`
+and `--target X Y Z` (default: fitted on the model's centroid), or `--eye X Y Z`, plus `--fov DEG`.
+The sidebar's "Copy view args" button copies the current pose in this form. Rendering options
+include `-c/--color`, `--matcap`, `--no-wireframe`, `--wire-width`, `--outline-width`,
+`--background R G B` and `--width/--height`:
+
+```bash
+./build/meshlets --screenshot shot.png --screenshot-pane -c shaded --no-wireframe \
+    --yaw -60 --pitch 20 --background 1 1 1
+```
 
 ## Layout
 
