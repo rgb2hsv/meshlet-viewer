@@ -386,7 +386,33 @@ struct App
     }
 
     void ui();
+    void progressOverlay();
 };
+
+// While a job runs, its progress text is drawn centered over the 3D view on a semi-transparent
+// black panel (as in springls-viewer), so it reads over any surface.
+void App::progressOverlay()
+{
+    if (!busy())
+        return;
+    const ImGuiIO& io = ImGui::GetIO();
+    const float viewLeft = sidebarWidth, viewWidth = std::max(0.f, io.DisplaySize.x - sidebarWidth);
+    if (viewWidth <= 0.f)
+        return;
+    const double elapsed = std::chrono::duration<double>(Clock::now() - jobStart).count();
+    char text[256];
+    std::snprintf(text, sizeof(text), "%s... %.1fs", jobLabel.c_str(), elapsed);
+    // size from a fixed-width elapsed time so the panel doesn't jitter as the digits change
+    char sizing[256];
+    std::snprintf(sizing, sizeof(sizing), "%s... 00.0s", jobLabel.c_str());
+    const ImVec2 textSize = ImGui::CalcTextSize(text), sizingSize = ImGui::CalcTextSize(sizing);
+    const ImVec2 size(std::max(textSize.x, sizingSize.x), textSize.y);
+    const ImVec2 at(std::floor(viewLeft + 0.5f * (viewWidth - size.x)), std::floor(0.5f * (io.DisplaySize.y - size.y)));
+    const ImVec2 pad(12.f, 8.f);
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    drawList->AddRectFilled(ImVec2(at.x - pad.x, at.y - pad.y), ImVec2(at.x + size.x + pad.x, at.y + size.y + pad.y), IM_COL32(0, 0, 0, 170), 6.f);
+    drawList->AddText(at, IM_COL32(255, 220, 120, 255), text);
+}
 
 void App::ui()
 {
@@ -1378,6 +1404,7 @@ int main(int argc, char** argv)
             app->ui();
         else
             app->sidebarWidth = 0.f;
+        app->progressOverlay();
         ImGui::Render();
 
         uint32_t imageIndex = 0;
