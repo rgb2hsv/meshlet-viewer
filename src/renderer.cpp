@@ -452,8 +452,11 @@ void MeshletRenderer::releaseScene()
              &fallbackIndices, &fallbackTriangles})
         ctx->destroyBuffer(*buffer);
     for (PerFrame& frame : frames)
+    {
         for (Buffer* buffer : {&frame.traversal, &frame.candidates, &frame.queues[0], &frame.queues[1]})
             ctx->destroyBuffer(*buffer);
+        frame.usedBvh = false; // collectStats() must not read the traversal buffer destroyed above
+    }
     lodRootCount = 0;
     lodNodesPerDepth.clear();
     meshletCount = triangleCount = previewTriangleCount = 0;
