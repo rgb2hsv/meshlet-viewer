@@ -69,7 +69,11 @@ version number guards against files from an incompatible build.
 
 Mouse: left-drag to orbit, Shift+left-drag or middle-drag to pan, right-drag or the
 wheel to zoom. "Auto-rotate" (or `--auto-rotate`, `--rotate-speed DEG`) turns the object about
-the screen's vertical axis through its center. You can also drop a `.ply`/`.obj`/`.mlod` file onto the window to load it.
+the screen's vertical axis through its center. "Auto-zoom" (or `--auto-zoom`, `--zoom-period SEC`,
+`--zoom-closest F`) moves the camera towards the object and back along a cosine curve: the gap
+between the camera and the object's bounding sphere shrinks to the closest fraction and grows back,
+so the camera never enters the object. Wheel zoom still sets the base distance, and turning it off
+keeps the current view. You can also drop a `.ply`/`.obj`/`.mlod` file onto the window to load it.
 
 While a model's meshlets are being built, the raw mesh is shown matcap shaded without the wireframe.
 

@@ -226,6 +226,52 @@ struct App
     Eigen::Quaternionf objectRotation = Eigen::Quaternionf::Identity();
     Eigen::Vector3f rotationCenter = Eigen::Vector3f::Zero();
 
+    // Auto-zoom: the eye moves towards the object and back along a cosine curve. camera.distance
+    // stays the base distance (mouse zoom still changes it); the curve only changes the view's distance.
+    bool autoZoom = false;
+    float zoomPeriod = 8.f;   // seconds for one in-and-out cycle
+    float zoomClosest = 0.4f; // closest point: fraction of the base gap to the object's bounding sphere
+    float zoomPhase = 0.f;    // [0, 1): 0 = base distance, 0.5 = closest
+
+    // Distance from the target for the current phase. What shrinks is the gap between the eye and
+    // the bounding sphere, so the eye never enters the object; the cosine runs in log space so moving
+    // in and out look equally fast, and starts and ends with zero velocity (no jump on enable).
+    float zoomedDistance() const
+    {
+        const float base = camera.distance;
+        if (!autoZoom)
+            return base;
+        const float blend = 0.5f * (1.f - std::cos(2.f * float(M_PI) * zoomPhase)); // 0 -> 1 -> 0
+        const float scale = std::pow(std::clamp(zoomClosest, 0.01f, 1.f), blend);
+        const float sphere = camera.radius;
+        const float distance = base > sphere ? sphere + (base - sphere) * scale // outside: shrink the gap
+                                             : base * scale;                    // already inside: plain scale
+        return std::max(distance, camera.radius * 0.001f);
+    }
+
+    void updateAutoZoom(float dt)
+    {
+        if (autoZoom && model)
+            zoomPhase = std::fmod(zoomPhase + dt / std::max(zoomPeriod, 0.1f), 1.f);
+    }
+
+    // Turning auto-zoom off keeps the current view: the animated distance becomes the base
+    void setAutoZoom(bool enabled)
+    {
+        if (!enabled && autoZoom)
+            camera.distance = zoomedDistance();
+        autoZoom = enabled;
+        zoomPhase = 0.f;
+    }
+
+    // The camera used for drawing this frame: the orbit camera with auto-zoom applied
+    Camera viewCamera() const
+    {
+        Camera view = camera;
+        view.distance = zoomedDistance();
+        return view;
+    }
+
     void resetRotation(const Model& m)
     {
         objectRotation = Eigen::Quaternionf::Identity();
@@ -399,6 +445,7 @@ struct App
                         camera.setEye(*initialEye);
                 }
                 resetRotation(*model);
+                zoomPhase = 0.f;
                 draw.wireWidth = firstLoad && wireWidthOverride > 0.f ? wireWidthOverride : model->avgEdgeLength * kAutoWireFraction;
                 draw.outlineWidth =
                     firstLoad && outlineWidthOverride > 0.f ? outlineWidthOverride : model->avgEdgeLength * kAutoOutlineFraction;
@@ -569,6 +616,7 @@ void App::ui()
             {
                 camera.frame(*model);
                 resetRotation(*model);
+                zoomPhase = 0.f;
             }
             ImGui::SameLine();
             if (ImGui::Button("Copy view args"))
@@ -583,6 +631,29 @@ void App::ui()
             ImGui::BeginDisabled(!autoRotate);
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderFloat("##rotatespeed", &rotateSpeed, -180.f, 180.f, "%.0f deg/s");
+            ImGui::EndDisabled();
+
+            bool zoom = autoZoom;
+            if (ImGui::Checkbox("Auto-zoom", &zoom))
+                setAutoZoom(zoom);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Move the camera towards the object and back along a cosine curve;\n"
+                                  "turning it off keeps the current distance");
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!autoZoom);
+            const float zoomWidth = std::max(1.f, 0.5f * (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x));
+            ImGui::SetNextItemWidth(zoomWidth);
+            ImGui::SliderFloat("##zoomperiod", &zoomPeriod, 1.f, 30.f, "%.1f s / cycle");
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Duration of one in-and-out cycle");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1);
+            float closestPercent = zoomClosest * 100.f;
+            if (ImGui::SliderFloat("##zoomclosest", &closestPercent, 5.f, 95.f, "closest %.0f%%"))
+                zoomClosest = closestPercent / 100.f;
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Closest point of the cycle, as a percentage of the current gap\n"
+                                  "between the camera and the object's bounding sphere");
             ImGui::EndDisabled();
 
             // save the mesh + meshlet hierarchy; loading the .mlod later skips the build
@@ -1038,6 +1109,9 @@ struct Options
     float zoom = 1.f;
     bool autoRotate = false;
     float rotateSpeed = 30.f;
+    bool autoZoom = false;
+    float zoomPeriod = 8.f;
+    float zoomClosest = 0.4f;
     float background[3] = {0.08f, 0.09f, 0.11f};
 
     // camera (angles in degrees; unset = framed on the model)
@@ -1106,6 +1180,9 @@ bool parseOptions(int argc, char** argv, Options& opt)
     program.add_argument("--no-cone-cull").flag().help("disable task-shader normal cone (backface) culling");
     program.add_argument("--highlight").metavar("INDEX").default_value(-1).nargs(1).scan<'i', int>().help("highlight one meshlet by index");
     program.add_argument("--auto-rotate").flag().help("turn the object about the screen's vertical axis");
+    program.add_argument("--auto-zoom").flag().help("move the camera towards the object and back along a cosine curve");
+    program.add_argument("--zoom-period").metavar("SEC").default_value(8.f).nargs(1).scan<'g', float>().help("auto-zoom: seconds per in-and-out cycle [1, 30]");
+    program.add_argument("--zoom-closest").metavar("F").default_value(0.4f).nargs(1).scan<'g', float>().help("auto-zoom: closest point as a fraction of the gap between the camera and the object's bounding sphere [0.05, 0.95]");
     program.add_argument("--rotate-speed").metavar("DEG").default_value(30.f).nargs(1).scan<'g', float>().help("auto-rotate speed in degrees per second (negative: other direction)");
     program.add_argument("--background").metavar("R G B").nargs(3).scan<'g', float>().help("R G B: background color, components in [0, 1]");
 
@@ -1253,6 +1330,15 @@ bool parseOptions(int argc, char** argv, Options& opt)
     opt.rotateSpeed = program.get<float>("--rotate-speed");
     if (program.is_used("--rotate-speed") && !opt.autoRotate)
         std::fprintf(stderr, "warning: --rotate-speed has no effect without --auto-rotate\n");
+    opt.autoZoom = program.get<bool>("--auto-zoom");
+    opt.zoomPeriod = program.get<float>("--zoom-period");
+    opt.zoomClosest = program.get<float>("--zoom-closest");
+    if ((program.is_used("--zoom-period") || program.is_used("--zoom-closest")) && !opt.autoZoom)
+        std::fprintf(stderr, "warning: --zoom-period/--zoom-closest have no effect without --auto-zoom\n");
+    if (opt.zoomPeriod < 1.f || opt.zoomPeriod > 30.f)
+        return fail("--zoom-period must be in [1, 30]");
+    if (opt.zoomClosest < 0.05f || opt.zoomClosest > 0.95f)
+        return fail("--zoom-closest must be in [0.05, 0.95]");
     if (opt.zoom <= 0.f)
         return fail("--zoom must be > 0");
     if (program.is_used("--background"))
@@ -1418,6 +1504,9 @@ int main(int argc, char** argv)
     app->autoRotate = opt.autoRotate;
     app->saveAfterBuild = opt.saveLod;
     app->rotateSpeed = opt.rotateSpeed;
+    app->autoZoom = opt.autoZoom;
+    app->zoomPeriod = opt.zoomPeriod;
+    app->zoomClosest = opt.zoomClosest;
 
     // --- ImGui ---
     IMGUI_CHECKVERSION();
@@ -1518,6 +1607,7 @@ int main(int argc, char** argv)
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         app->camera.update(ImGui::GetIO());
+        app->updateAutoZoom(ImGui::GetIO().DeltaTime);
         app->updateLodSweep(ImGui::GetIO().DeltaTime);
         if (app->showUi)
             app->ui();
@@ -1548,8 +1638,9 @@ int main(int argc, char** argv)
         const float sidebarPixels = std::min(app->sidebarWidth * ImGui::GetIO().DisplayFramebufferScale.x, float(ctx.swapchain.extent.width) - 1.f);
         app->draw.viewportX = sidebarPixels;
         float aspect = (float(ctx.swapchain.extent.width) - sidebarPixels) / float(ctx.swapchain.extent.height);
+        const Camera view = app->viewCamera(); // the orbit camera with auto-zoom applied
         Eigen::Vector3f viewRight, viewUp, viewBack; // camera basis, world space
-        app->camera.basis(viewRight, viewUp, viewBack);
+        view.basis(viewRight, viewUp, viewBack);
 
         if (app->autoRotate && app->model)
         {
@@ -1564,9 +1655,9 @@ int main(int argc, char** argv)
             Eigen::Translation3f(app->rotationCenter) * Eigen::Affine3f(rotation) * Eigen::Translation3f(-app->rotationCenter);
         const Eigen::Affine3f worldToModel = modelToWorld.inverse();
 
-        app->draw.viewProj = app->camera.viewProj(aspect) * modelToWorld.matrix();
-        app->draw.cameraPos = worldToModel * app->camera.eye();
-        app->draw.lightDir = rotation.transpose() * app->camera.lightDir();
+        app->draw.viewProj = view.viewProj(aspect) * modelToWorld.matrix();
+        app->draw.cameraPos = worldToModel * view.eye();
+        app->draw.lightDir = rotation.transpose() * view.lightDir();
         app->draw.viewRight = rotation.transpose() * viewRight;
         app->draw.viewUp = rotation.transpose() * viewUp;
         app->draw.viewBack = rotation.transpose() * viewBack;
@@ -1574,8 +1665,8 @@ int main(int argc, char** argv)
         // frozen snapshots are in model space too, so a frozen cut stays attached to the object
         app->draw.cullViewProj = app->freezeLod ? app->frozenViewProj : app->draw.viewProj;
         app->draw.cullCameraPos = app->freezeLod ? app->frozenEye : app->draw.cameraPos;
-        app->draw.zNear = app->camera.zNear();
-        app->draw.lodScale = app->camera.projScale() * 0.5f * float(ctx.swapchain.extent.height);
+        app->draw.zNear = view.zNear();
+        app->draw.lodScale = view.projScale() * 0.5f * float(ctx.swapchain.extent.height);
         app->renderer.record(cmd, frameIndex, imageIndex, app->draw,
             [](VkCommandBuffer c) { ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), c); });
 
