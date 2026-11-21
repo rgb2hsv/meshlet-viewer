@@ -747,7 +747,7 @@ bool loadModel(const std::string& path, Model& model, std::string& error, bool o
     else if (ext == "obj")
         ok = loadObj(path, model, hasNormals, error);
     else
-        error = "unsupported file extension (expected .ply or .obj): " + path;
+        error = "unsupported file extension (expected .ply, .obj or .mlod): " + path;
     if (!ok)
         return false;
 

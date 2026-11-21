@@ -113,6 +113,7 @@ add_executable(meshlets
     src/model.cpp
     src/renderer.cpp
     src/matcap.cpp
+    src/meshlet_file.cpp
     ${SHADER_HEADERS}
 )
 add_dependencies(meshlets shaders)
@@ -120,6 +121,7 @@ target_compile_definitions(meshlets PRIVATE MESHLETS_ASSET_DIR="${CMAKE_CURRENT_
 target_include_directories(meshlets PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${SHADER_OUT_DIR})
 target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/stb)   # stb_image (matcap PNGs)
 target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/eigen) # Eigen (header-only vector math)
+target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/cereal/include) # cereal (header-only serialization)
 target_link_libraries(meshlets PRIVATE meshoptimizer argparse::argparse imgui::imgui glfw volk::volk Threads::Threads)
 
 if(MSVC)

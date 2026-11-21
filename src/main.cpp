@@ -1,6 +1,7 @@
 // meshlets: load a PLY/OBJ model, split it into meshlets with meshoptimizer and
 // visualize them with Vulkan mesh shaders (vertex-shader fallback) + Dear ImGui.
 #include "matcap.h"
+#include "meshlet_file.h"
 #include "camera_math.h"
 #include "model.h"
 #include "renderer.h"
@@ -16,6 +17,7 @@
 #include <cctype>
 #include <cfloat>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <optional>
@@ -169,7 +171,10 @@ struct JobResult
 {
     std::shared_ptr<Model> model; // non-null when a new model was loaded
     std::shared_ptr<MeshletData> meshlets;
+    MeshletSettings settings; // what meshlets were built with
     std::string error;
+    std::string message; // status line for jobs that load or build nothing (saving)
+    bool save = false;
 };
 
 struct App
@@ -195,6 +200,9 @@ struct App
     static constexpr float kAutoOutlineFraction = 0.25f; // meshlet outlines: 25% of the average edge
     bool firstLoad = true;
     bool loadFailed = false; // a load failed and no model is available
+    bool saveFailed = false;
+    std::string saveAfterBuild; // --save-lod: saved once the meshlets are ready
+    MeshletSettings builtSettings; // settings of the current meshlets (the sidebar may differ)
 
     std::future<JobResult> job;
     std::string jobLabel;
@@ -203,6 +211,7 @@ struct App
     bool statusIsError = false;
 
     char pathInput[1024] = {};
+    char savePathInput[1024] = {};
 
     DrawParams draw;
     std::vector<ImTextureID> matcapTextures; // ImGui handles for the selector thumbnails
@@ -249,15 +258,38 @@ struct App
 
     bool busy() const { return job.valid(); }
 
+    // a file dropped or loaded while a job runs; opened as soon as that job finishes
+    std::string pendingLoad;
+
     void startLoad(const std::string& path)
     {
         if (busy())
+        {
+            pendingLoad = path; // the latest request wins
             return;
+        }
+        pendingLoad.clear();
         std::snprintf(pathInput, sizeof(pathInput), "%s", path.c_str());
         jobLabel = "Loading " + fileName(path);
         jobStart = Clock::now();
         bool vcache = optimizeVertexCache;
-        // loads only; pollJob() shows the raw mesh and then starts building the meshlets
+        if (isMeshletFile(path))
+        {
+            // a saved hierarchy: mesh + meshlets in one file, nothing to build
+            job = std::async(std::launch::async, [path] {
+                JobResult result;
+                auto loaded = std::make_shared<Model>();
+                auto data = std::make_shared<MeshletData>();
+                if (loadMeshletFile(path, *loaded, result.settings, *data, result.error))
+                {
+                    result.model = loaded;
+                    result.meshlets = data;
+                }
+                return result;
+            });
+            return;
+        }
+        // loads only; finishJob() shows the raw mesh and then starts building the meshlets
         job = std::async(std::launch::async, [path, vcache] {
             JobResult result;
             auto loaded = std::make_shared<Model>();
@@ -267,10 +299,41 @@ struct App
         });
     }
 
+    // Saves the current model + meshlets (with the settings they were built with) as a .mlod file
+    void startSave(const std::string& path)
+    {
+        if (busy() || !model || !meshlets)
+            return;
+        jobLabel = "Saving " + fileName(path);
+        jobStart = Clock::now();
+        std::shared_ptr<const Model> m = model;
+        std::shared_ptr<const MeshletData> d = meshlets;
+        MeshletSettings s = builtSettings;
+        Clock::time_point start = jobStart;
+        job = std::async(std::launch::async, [path, m, d, s, start] {
+            JobResult result;
+            result.save = true;
+            if (saveMeshletFile(path, *m, s, *d, result.error))
+            {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf), "Saved %s in %.2fs", fileName(path).c_str(),
+                    std::chrono::duration<double>(Clock::now() - start).count());
+                result.message = buf;
+            }
+            return result;
+        });
+    }
+
     void startBuild()
     {
         if (!model)
             return;
+        if (!pendingLoad.empty())
+        {
+            // another model is about to replace this one: don't build meshlets for it
+            rebuildPending = false;
+            return;
+        }
         if (busy())
         {
             rebuildPending = true;
@@ -283,6 +346,7 @@ struct App
         MeshletSettings s = settings;
         job = std::async(std::launch::async, [m, s] {
             JobResult result;
+            result.settings = s;
             auto built = std::make_shared<MeshletData>();
             if (buildMeshlets(*m, s, *built, result.error))
                 result.meshlets = built;
@@ -292,16 +356,31 @@ struct App
 
     void pollJob()
     {
-        if (!busy() || job.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-            return;
+        if (busy() && job.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+            finishJob(job.get());
+        if (!busy() && !pendingLoad.empty())
+        {
+            const std::string next = std::move(pendingLoad); // startLoad() clears pendingLoad
+            startLoad(next);
+        }
+    }
 
-        JobResult result = job.get();
+    void finishJob(JobResult result)
+    {
         if (!result.error.empty())
         {
             status = result.error;
             statusIsError = true;
             std::fprintf(stderr, "error: %s\n", result.error.c_str());
             loadFailed = !model || !meshlets;
+            saveFailed |= result.save;
+        }
+        else if (result.save)
+        {
+            status = result.message;
+            statusIsError = false;
+            std::printf("%s\n", result.message.c_str());
+            std::fflush(stdout);
         }
         else
         {
@@ -328,7 +407,17 @@ struct App
                     draw.highlight = -1; // keep --highlight for the first model
                 firstLoad = false;
                 glfwSetWindowTitle(ctx.window, ("meshlets - " + fileName(model->path)).c_str());
-
+                std::snprintf(savePathInput, sizeof(savePathInput), "%s",
+                    std::filesystem::path(model->path).replace_extension(kMeshletFileExtension).string().c_str());
+            }
+            if (result.model && result.meshlets)
+            {
+                // loaded from a .mlod file: show its settings in the sidebar, skip building
+                settings = result.settings;
+                rebuildPending = false;
+            }
+            else if (result.model)
+            {
                 // show the raw mesh (matcap shaded, no wireframe) while its meshlets are built
                 meshlets.reset();
                 renderer.uploadPreview(*model);
@@ -339,17 +428,22 @@ struct App
                 return;
             }
             meshlets = result.meshlets;
+            builtSettings = result.settings;
+            const bool fromFile = result.model != nullptr;
             draw.highlight = std::min(draw.highlight, int(meshlets->meshlets.size()) - 1);
             renderer.upload(*model, *meshlets);
 
             const MeshletData& m = *meshlets;
             const char* algorithmNames[] = {"greedy", "flex", "spatial", "scan"};
-            const char* builder = m.lod ? (settings.lodSpatial ? "lod-spatial" : "lod-flex") : algorithmNames[int(settings.algorithm)];
+            const MeshletSettings& bs = builtSettings;
+            const char* builder = m.lod ? (bs.lodSpatial ? "lod-spatial" : "lod-flex") : algorithmNames[int(bs.algorithm)];
             std::printf("%s: %zu vertices, %zu triangles, avg edge %.4g | %s v%d t%d -> %zu meshlets, avg %.1f verts / %.1f tris, "
                         "cone-cullable %.0f%%, build %.2fs\n",
                 fileName(model->path).c_str(), model->vertices.size(), model->indices.size() / 3, model->avgEdgeLength, builder,
-                settings.maxVertices, settings.maxTriangles, m.levelClusters[0], m.avgVertices, m.avgTriangles,
+                bs.maxVertices, bs.maxTriangles, m.levelClusters[0], m.avgVertices, m.avgTriangles,
                 100.0 * double(m.coneCullableFraction), m.buildSeconds);
+            if (fromFile)
+                std::printf("  loaded from file in %.2fs (build time above is from when it was saved)\n", model->loadSeconds);
             if (m.lod)
             {
                 std::printf("  lod: %zu levels, %zu clusters total, triangles per level:", m.levelClusters.size(), m.meshlets.size());
@@ -360,9 +454,18 @@ struct App
             std::fflush(stdout);
 
             char buf[256];
-            std::snprintf(buf, sizeof(buf), "%s meshlets in %.2fs", formatCount(m.meshlets.size()).c_str(), m.buildSeconds);
+            if (fromFile)
+                std::snprintf(buf, sizeof(buf), "%s meshlets loaded in %.2fs", formatCount(m.meshlets.size()).c_str(), model->loadSeconds);
+            else
+                std::snprintf(buf, sizeof(buf), "%s meshlets in %.2fs", formatCount(m.meshlets.size()).c_str(), m.buildSeconds);
             status = buf;
             statusIsError = false;
+
+            if (!saveAfterBuild.empty())
+            {
+                startSave(saveAfterBuild);
+                saveAfterBuild.clear();
+            }
         }
 
         if (rebuildPending)
@@ -401,10 +504,11 @@ void App::progressOverlay()
         return;
     const double elapsed = std::chrono::duration<double>(Clock::now() - jobStart).count();
     char text[256];
-    std::snprintf(text, sizeof(text), "%s... %.1fs", jobLabel.c_str(), elapsed);
+    const std::string next = pendingLoad.empty() ? std::string() : ", then opening " + fileName(pendingLoad);
+    std::snprintf(text, sizeof(text), "%s... %.1fs%s", jobLabel.c_str(), elapsed, next.c_str());
     // size from a fixed-width elapsed time so the panel doesn't jitter as the digits change
     char sizing[256];
-    std::snprintf(sizing, sizeof(sizing), "%s... 00.0s", jobLabel.c_str());
+    std::snprintf(sizing, sizeof(sizing), "%s... 00.0s%s", jobLabel.c_str(), next.c_str());
     const ImVec2 textSize = ImGui::CalcTextSize(text), sizingSize = ImGui::CalcTextSize(sizing);
     const ImVec2 size(std::max(textSize.x, sizingSize.x), textSize.y);
     const ImVec2 at(std::floor(viewLeft + 0.5f * (viewWidth - size.x)), std::floor(0.5f * (io.DisplaySize.y - size.y)));
@@ -448,11 +552,9 @@ void App::ui()
         ImGui::SetNextItemWidth(-60);
         bool enter = ImGui::InputTextWithHint("##path", "path/to/model.ply", pathInput, sizeof(pathInput), ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
-        ImGui::BeginDisabled(busy());
         if ((ImGui::Button("Load", ImVec2(-1, 0)) || enter) && pathInput[0])
-            startLoad(pathInput);
-        ImGui::EndDisabled();
-        ImGui::TextDisabled("Tip: drag & drop a .ply/.obj onto the window");
+            startLoad(pathInput); // queued if a job is running
+        ImGui::TextDisabled("Tip: drag & drop a .ply/.obj/.mlod onto the window");
         ImGui::Checkbox("Optimize vertex cache on load", &optimizeVertexCache);
 
         if (model)
@@ -482,6 +584,19 @@ void App::ui()
             ImGui::SetNextItemWidth(-1);
             ImGui::SliderFloat("##rotatespeed", &rotateSpeed, -180.f, 180.f, "%.0f deg/s");
             ImGui::EndDisabled();
+
+            // save the mesh + meshlet hierarchy; loading the .mlod later skips the build
+            ImGui::SetNextItemWidth(-60);
+            bool saveEnter = ImGui::InputTextWithHint("##savepath", "path/to/model.mlod", savePathInput, sizeof(savePathInput),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(busy() || !meshlets);
+            if ((ImGui::Button("Save", ImVec2(-1, 0)) || saveEnter) && savePathInput[0] && meshlets)
+                startSave(savePathInput);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip("Save the mesh and its meshlet LOD hierarchy as one .mlod file (cereal portable binary);\n"
+                                  "load or drop the .mlod later to skip loading and building");
         }
     }
 
@@ -938,6 +1053,7 @@ struct Options
     int width = 1600, height = 1000;
     int frames = 0;
     std::string screenshot;
+    std::string saveLod;
 };
 
 bool parseOptions(int argc, char** argv, Options& opt)
@@ -948,10 +1064,11 @@ bool parseOptions(int argc, char** argv, Options& opt)
 
     // ---- input ----
     program.add_group("Input");
-    program.add_argument("model").nargs(argparse::nargs_pattern::optional).help("model to load (.ply or .obj); defaults to assets/model/metasphere.ply");
+    program.add_argument("model").nargs(argparse::nargs_pattern::optional).help("model to load (.ply or .obj), or a saved meshlet hierarchy (.mlod) to skip the build; defaults to assets/model/metasphere.ply");
     program.add_argument("-i", "--input").metavar("PATH").help("model to load (same as the positional argument)");
     program.add_argument("--z-up").flag().help("treat +Z as up");
     program.add_argument("--y-up").flag().help("treat +Y as up (default)");
+    program.add_argument("--save-lod").metavar("FILE").default_value(std::string()).nargs(1).help("once the meshlets are ready, save the mesh and its meshlet hierarchy to FILE (.mlod); pass the .mlod as the model later to skip the build");
     program.add_argument("--no-vertex-cache").flag().help("skip meshopt_optimizeVertexCache on the index buffer after loading");
 
     // ---- meshlets ----
@@ -1040,6 +1157,7 @@ bool parseOptions(int argc, char** argv, Options& opt)
         return fail("--z-up and --y-up are mutually exclusive");
     opt.upAxis = program.get<bool>("--z-up") ? 'z' : program.get<bool>("--y-up") ? 'y' : 0;
     opt.vertexCache = !program.get<bool>("--no-vertex-cache");
+    opt.saveLod = program.get<std::string>("--save-lod");
 
     // meshlets
     MeshletSettings& m = opt.meshlets;
@@ -1298,6 +1416,7 @@ int main(int argc, char** argv)
     app->showUi = opt.showUi;
     app->sidebarWidth = opt.sidebarWidth;
     app->autoRotate = opt.autoRotate;
+    app->saveAfterBuild = opt.saveLod;
     app->rotateSpeed = opt.rotateSpeed;
 
     // --- ImGui ---
@@ -1522,6 +1641,8 @@ int main(int argc, char** argv)
     VK_CHECK(vkDeviceWaitIdle(ctx.device));
     if (app->busy())
         app->job.wait();
+    if (app->saveFailed)
+        exitCode = 1;
 
     ImGui_ImplVulkan_Shutdown();
     ImGui_ImplGlfw_Shutdown();

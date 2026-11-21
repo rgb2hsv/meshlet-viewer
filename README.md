@@ -24,6 +24,8 @@ The UI is a Dear ImGui sidebar on the left (on GLFW); drag its right edge to res
   to inspect the cut from elsewhere and see per-level cluster/triangle stats. Lucy: 19 levels,
   45 s single-threaded build; the full view draws ~85K of 28M triangles at 1 px
 - Loading and meshlet building run on a background thread (Lucy, 28M triangles: about 5s + 12s)
+- Save the mesh and its meshlet hierarchy as one `.mlod` file ([cereal](https://github.com/USCiLab/cereal)
+  portable binary) and load it later in place of the model to skip loading and building
 
 ## Setup
 
@@ -51,12 +53,23 @@ cmake --build build
 ./build/meshlets -c shaded --matcap metal_carpaint --outline-width 0.3 --wire-width 0.05
 ./build/meshlets --lod-error 2          # coarser cut (or --lod-level N for a fixed level)
 ./build/meshlets --lod-sweep           # step through the levels and back ("Sweep levels" in the sidebar)
+./build/meshlets --save-lod model.mlod  # save the mesh + meshlet hierarchy once it is built
+./build/meshlets model.mlod            # load it back: no rebuild
 ./build/meshlets --help                # all options
 ```
 
+A `.mlod` file holds the mesh (vertices, indices), the builder settings and everything the
+renderer uploads: clusters, bounds, per-cluster LOD data, edge masks and the LOD selection BVH.
+Save it with `--save-lod FILE` (written once the meshlets are ready, so it combines with
+`--frames`/`--screenshot` for batch use) or with the Save button in the sidebar's Model section.
+Pass it as the model, or drop it onto the window, to show the hierarchy without rebuilding; the
+sidebar then shows the settings it was built with, and changing them rebuilds from the saved mesh.
+The file is cereal's portable binary archive, so it reads on machines of either endianness; a
+version number guards against files from an incompatible build.
+
 Mouse: left-drag to orbit, Shift+left-drag or middle-drag to pan, right-drag or the
 wheel to zoom. "Auto-rotate" (or `--auto-rotate`, `--rotate-speed DEG`) turns the object about
-the screen's vertical axis through its center. You can also drop a `.ply`/`.obj` file onto the window to load it.
+the screen's vertical axis through its center. You can also drop a `.ply`/`.obj`/`.mlod` file onto the window to load it.
 
 While a model's meshlets are being built, the raw mesh is shown matcap shaded without the wireframe.
 
@@ -84,10 +97,11 @@ include `-c/--color`, `--matcap`, `--no-wireframe`, `--wire-width`, `--outline-w
 | `src/model.*` | PLY (ascii / binary LE / BE) + OBJ loading, meshlet building and stats |
 | `src/vk_context.*` | Vulkan instance/device/swapchain, buffers (buffer device address) |
 | `src/renderer.*` | Mesh-shader and fallback pipelines, per-frame stats and GPU timing |
+| `src/meshlet_file.*` | `.mlod` save/load of the mesh + meshlet hierarchy (cereal portable binary) |
 | `src/matcap.*` | Loads the matcap PNGs from `assets/matcap/` (stb_image) |
 | `src/main.cpp` | Command-line options, ImGui UI, camera, background jobs |
 | `shaders/` | `meshlet.task`, `meshlet.mesh`, `meshlet.vert`, `meshlet.frag`, `lod_traverse.comp`, `lod_finalize.comp`, `common.glsl` |
-| `external/` | Submodules: meshoptimizer, imgui, argparse, glfw, volk, Vulkan-Headers, glslang, stb, Eigen (vector math, header-only), liblava (not built) |
+| `external/` | Submodules: meshoptimizer, cereal (serialization, header-only), imgui, argparse, glfw, volk, Vulkan-Headers, glslang, stb, Eigen (vector math, header-only), liblava (not built) |
 
 `assets/matcap/*.png` are Blender's matcaps (`datafiles/studiolights/matcap`, CC0, see
 `assets/matcap/license.txt`). They were converted from Blender's EXRs as
