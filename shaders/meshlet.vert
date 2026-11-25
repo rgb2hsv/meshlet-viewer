@@ -11,6 +11,7 @@ layout(location = 2) flat out uint outMeshletTriangle;
 layout(location = 3) flat out vec3 outAltitudes;
 layout(location = 4) out vec3 outBarycentric;
 layout(location = 5) flat out uint outEdgeMask;
+layout(location = 6) out vec2 outUv;
 
 vec3 position(uint corner)
 {
@@ -23,7 +24,9 @@ void main()
     uint corner = uint(gl_VertexIndex) % 3u;
     uint first = uint(gl_VertexIndex) - corner;
 
-    Vertex v = pc.vertices.v[pc.fallbackIndices.d[gl_VertexIndex]];
+    uint vi = pc.fallbackIndices.d[gl_VertexIndex];
+    Vertex v = pc.vertices.v[vi];
+    outUv = (pc.globals.flags & FLAG_UV_GRID) != 0u ? pc.texcoords.t[vi] : vec2(0.0);
     vec3 p = vec3(v.px, v.py, v.pz);
     gl_Position = pc.globals.viewProj * vec4(p, 1.0);
     outNormal = vec3(v.nx, v.ny, v.nz);

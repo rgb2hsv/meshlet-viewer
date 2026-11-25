@@ -15,6 +15,7 @@
 #define FLAG_WIREFRAME 4u
 #define FLAG_LOD_CANDIDATES 8u // task shader reads the BVH-selected cluster list instead of all clusters
 #define FLAG_PREVIEW 16u       // vertex path draws the raw index buffer (no meshlets yet): no per-triangle ids or edge masks
+#define FLAG_UV_GRID 32u       // grid over the texture coordinates instead of the triangle wireframe (needs pc.texcoords)
 
 #define MODE_MESHLET 0u
 #define MODE_TRIANGLE 1u
@@ -55,6 +56,7 @@ layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Ver
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer MeshletBuffer { Meshlet m[]; };
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer BoundsBuffer { Bounds b[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer UintBuffer { uint d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer TexcoordBuffer { vec2 t[]; };
 struct MeshletLod
 {
     vec4 selfSphere;   // xyz center, w radius: bounds of this cluster's own error
@@ -111,7 +113,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Gl
     float wireWidth;    // triangle wireframe line width in model units (0 = off)
     int matcap;         // index into matcaps[], -1 = plain lighting
     float outlineWidth; // meshlet perimeter outline width in model units (0 = off)
-    float pad1;
+    float uvGridCells;  // FLAG_UV_GRID: grid cells per unit of texture coordinates
     vec4 viewRight;   // camera basis in world space (view-space x, y, z)
     vec4 viewUp;
     vec4 viewBack;
@@ -131,6 +133,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Gl
     uint lodRootCount;       // roots are nodes[0, lodRootCount)
     uint lodLevelCount;      // DAG levels, for the meshlet color gradient
     uint pad4, pad5;
+    vec4 levelColors[MAX_LOD_LEVELS]; // rgb: sRGB-encoded LOD level colors (src/lod_palette.*)
 };
 
 layout(push_constant) uniform PushConstants
@@ -146,6 +149,7 @@ layout(push_constant) uniform PushConstants
     StatsBuffer stats;
     LodBuffer lods;
     UintBuffer edgeMasks;  // per triangle, bytes: meshlet perimeter edges (bit i: edge opposite vertex i)
+    TexcoordBuffer texcoords; // per vertex, only read with FLAG_UV_GRID
     uint traversalDepth; // lod_traverse.comp: BVH depth processed by this dispatch
 } pc;
 

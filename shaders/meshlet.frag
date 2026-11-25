@@ -15,11 +15,13 @@ layout(location = 1) in vec3 inWorldPos;
 layout(location = 2) perprimitiveEXT flat in uint inMeshletTriangle;
 layout(location = 3) perprimitiveEXT flat in vec3 inAltitudes;
 layout(location = 4) perprimitiveEXT flat in uint inEdgeMask;
+layout(location = 5) in vec2 inUv;
 #else
 layout(location = 2) flat in uint inMeshletTriangle;
 layout(location = 3) flat in vec3 inAltitudes;
 layout(location = 4) in vec3 inBarycentric;
 layout(location = 5) flat in uint inEdgeMask;
+layout(location = 6) in vec2 inUv;
 #endif
 
 layout(location = 0) out vec4 outColor;
@@ -28,16 +30,11 @@ layout(location = 0) out vec4 outColor;
 layout(constant_id = 0) const int MATCAP_COUNT = 1;
 layout(set = 0, binding = 0) uniform sampler2D matcaps[MATCAP_COUNT];
 
-// Color gradient over the LOD levels: full detail (level 0) blue -> cyan -> green -> yellow ->
-// orange for the coarsest level.
-vec3 lodGradient(uint level, uint levelCount)
+// LOD level colors: a CIELAB palette made on the CPU (src/lod_palette.*), lightest at level 0,
+// evenly spaced in L* down to the coarsest level
+vec3 lodColor(Globals g, uint level)
 {
-    const vec3 stops[5] = vec3[5](vec3(0.20, 0.45, 0.95), vec3(0.15, 0.75, 0.85), vec3(0.30, 0.80, 0.40), vec3(0.95, 0.85, 0.25),
-        vec3(0.95, 0.45, 0.20));
-    float t = levelCount > 1u ? float(level) / float(levelCount - 1u) : 0.0;
-    float x = clamp(t, 0.0, 1.0) * 4.0;
-    int i = min(int(x), 3);
-    return mix(stops[i], stops[i + 1], x - float(i));
+    return g.levelColors[min(level, min(g.lodLevelCount, MAX_LOD_LEVELS) - 1u)].rgb;
 }
 
 vec3 linearToSrgb(vec3 c)
@@ -88,6 +85,20 @@ vec2 lineCoverage(float wireWidth, float outlineWidth)
 #endif
 }
 
+// UV grid: (line coverage, checker shade) for `cells` grid cells per unit of texture space. Lines
+// are about 1.25 pixels wide and anti-aliased; the faint checker shows the cells' orientation and
+// stretch. Both fade out where cells get smaller than a few pixels, instead of aliasing.
+vec2 uvGrid(vec2 uv, float cells)
+{
+    vec2 p = uv * cells;
+    vec2 pixel = max(fwidth(p), vec2(1e-6)); // cells per pixel
+    vec2 distance = abs(fract(p + 0.5) - 0.5) / pixel; // pixels to the nearest line
+    vec2 line = clamp(0.5 * 1.25 + 0.5 - distance, 0.0, 1.0);
+    float fade = clamp(1.5 - 4.0 * max(pixel.x, pixel.y), 0.0, 1.0); // gone below ~3 pixels per cell
+    float checker = mod(floor(p.x) + floor(p.y), 2.0);
+    return vec2(max(line.x, line.y) * fade, 1.0 - 0.1 * checker * fade);
+}
+
 void main()
 {
     Globals g = pc.globals;
@@ -106,7 +117,9 @@ void main()
 
     vec3 color;
     if (g.mode == MODE_MESHLET)
-        color = lodGradient(pc.lods.l[meshlet].level, g.lodLevelCount) * light;
+        // shading only spans the upper part of the range, so even the shadowed side keeps the
+        // palette's lightness (and its contrast with the black lines)
+        color = lodColor(g, pc.lods.l[meshlet].level) * mix(0.62, 1.0, clamp(light, 0.0, 1.0));
     else if (g.mode == MODE_TRIANGLE)
         color = hashColor(meshlet * 512u + triangle) * light;
     else if (g.mode == MODE_NORMAL)
@@ -115,6 +128,14 @@ void main()
         color = matcapColor(g, n, viewDir);
     else
         color = vec3(0.8) * light;
+
+    if ((g.flags & FLAG_UV_GRID) != 0u)
+    {
+        // replaces the triangle wireframe (wireWidth is 0 then); meshlet outlines still follow
+        vec2 grid = uvGrid(inUv, g.uvGridCells);
+        color *= grid.y;
+        color = mix(color, vec3(0.0), grid.x * 0.75);
+    }
 
     if ((g.flags & FLAG_WIREFRAME) != 0u)
     {

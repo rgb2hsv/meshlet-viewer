@@ -114,6 +114,8 @@ add_executable(meshlets
     src/renderer.cpp
     src/matcap.cpp
     src/meshlet_file.cpp
+    src/meshlet_optimizer.cpp
+    src/lod_palette.cpp
     ${SHADER_HEADERS}
 )
 add_dependencies(meshlets shaders)
@@ -123,6 +125,37 @@ target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/stb)   # stb_
 target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/eigen) # Eigen (header-only vector math)
 target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/cereal/include) # cereal (header-only serialization)
 target_link_libraries(meshlets PRIVATE meshoptimizer argparse::argparse imgui::imgui glfw volk::volk Threads::Threads)
+
+# --- meshlet-optimizer -------------------------------------------------------
+# Built as its own project (C++20, OpenMP, its own dependencies) and run by the viewer as a child
+# process: the "meshlet-optimizer" LOD source writes the mesh to a temporary PLY, runs the tool and
+# loads the .mlod it writes. Release even in debug viewer builds: the hierarchy build is heavy.
+set(MESHLET_OPTIMIZER_DIR ${EXTERNAL_DIR}/meshlet-optimizer CACHE PATH "meshlet-optimizer source tree")
+if(EXISTS ${MESHLET_OPTIMIZER_DIR}/CMakeLists.txt)
+    include(ExternalProject)
+    set(MOPT_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/meshlet-optimizer)
+    if(CMAKE_CONFIGURATION_TYPES)
+        set(MOPT_EXE ${MOPT_BINARY_DIR}/Release/meshlet-optimizer${CMAKE_EXECUTABLE_SUFFIX})
+    else()
+        set(MOPT_EXE ${MOPT_BINARY_DIR}/meshlet-optimizer${CMAKE_EXECUTABLE_SUFFIX})
+    endif()
+    ExternalProject_Add(meshlet_optimizer
+        SOURCE_DIR ${MESHLET_OPTIMIZER_DIR}
+        BINARY_DIR ${MOPT_BINARY_DIR}
+        CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release
+                   -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+                   -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release --target meshlet-optimizer
+        BUILD_BYPRODUCTS ${MOPT_EXE}
+        INSTALL_COMMAND ""
+        BUILD_ALWAYS ON
+        USES_TERMINAL_BUILD ON)
+    add_dependencies(meshlets meshlet_optimizer)
+    target_compile_definitions(meshlets PRIVATE MESHLET_OPTIMIZER_EXE="${MOPT_EXE}")
+else()
+    message(WARNING "${MESHLET_OPTIMIZER_DIR} is missing: the meshlet-optimizer LOD source is unavailable "
+                    "(run: git submodule update --init --recursive)")
+endif()
 
 if(MSVC)
     target_compile_options(meshlets PRIVATE /W4)

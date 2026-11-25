@@ -220,6 +220,33 @@ uint32_t readBinaryIndex(const char* p, PlyType type, bool swap)
     }
 }
 
+// Texture coordinates given per triangle corner (index): vertices whose corners have different
+// coordinates (texture seams) are split, so the model gets one texture coordinate per vertex.
+void splitByTexcoords(Model& model, const std::vector<Texcoord>& cornerUv)
+{
+    struct Corner
+    {
+        Vertex vertex;
+        Texcoord uv;
+    };
+    std::vector<Corner> corners(model.indices.size());
+    for (size_t i = 0; i < corners.size(); ++i)
+        corners[i] = {model.vertices[model.indices[i]], cornerUv[i]};
+    std::vector<unsigned int> remap(corners.size());
+    const size_t vertexCount =
+        meshopt_generateVertexRemap(remap.data(), nullptr, corners.size(), corners.data(), corners.size(), sizeof(Corner));
+    std::vector<Corner> unique(vertexCount);
+    meshopt_remapVertexBuffer(unique.data(), corners.data(), corners.size(), sizeof(Corner), remap.data());
+    model.vertices.resize(vertexCount);
+    model.texcoords.resize(vertexCount);
+    for (size_t v = 0; v < vertexCount; ++v)
+    {
+        model.vertices[v] = unique[v].vertex;
+        model.texcoords[v] = unique[v].uv;
+    }
+    meshopt_remapIndexBuffer(model.indices.data(), nullptr, corners.size(), remap.data());
+}
+
 bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::string& error)
 {
     std::vector<char> data;
@@ -318,6 +345,8 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
 
     hasNormals = false;
     const bool swap = format == PlyFormat::BinaryBE; // assumes a little-endian host
+    std::vector<Texcoord> vertexUv, cornerUv; // per vertex / per index (triangle corner)
+    bool cornerUvValid = true;
 
     for (const PlyElement& element : elements)
     {
@@ -326,9 +355,23 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
 
         // property slots we care about
         int pos[3] = {-1, -1, -1}, nrm[3] = {-1, -1, -1}, faceList = -1;
+        int uv[2] = {-1, -1}; // vertex texture coordinates: u/v, s/t or texture_u/texture_v
+        int faceUvList = -1;  // face texture coordinates per corner (u0 v0 u1 v1 ...), as MeshLab writes them
         for (size_t i = 0; i < element.properties.size(); ++i)
         {
             const std::string& name = element.properties[i].name;
+            if (isVertex && !element.properties[i].isList && uv[0] < 0)
+            {
+                if (name == "u" || name == "s" || name == "texture_u")
+                    uv[0] = int(i);
+            }
+            if (isVertex && !element.properties[i].isList && uv[1] < 0)
+            {
+                if (name == "v" || name == "t" || name == "texture_v")
+                    uv[1] = int(i);
+            }
+            if (isFace && element.properties[i].isList && name == "texcoord")
+                faceUvList = int(i);
             if (isVertex)
             {
                 if (name == "x") pos[0] = int(i);
@@ -351,6 +394,8 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
             }
             hasNormals = nrm[0] >= 0 && nrm[1] >= 0 && nrm[2] >= 0;
             model.vertices.resize(element.count);
+            if (uv[0] >= 0 && uv[1] >= 0)
+                vertexUv.resize(element.count);
         }
         if (isFace)
         {
@@ -360,7 +405,21 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
                 return false;
             }
             model.indices.reserve(element.count * 3);
+            if (faceUvList >= 0)
+                cornerUv.reserve(element.count * 3);
         }
+        // a face's corner texture coordinates, fan-triangulated like its indices
+        auto addFaceUv = [&](const float* faceUv, uint32_t uvCount, uint32_t cornerCount) {
+            if (faceUvList < 0 || cornerCount < 3)
+                return;
+            if (uvCount != 2 * cornerCount)
+                cornerUvValid = false;
+            if (!cornerUvValid)
+                return;
+            for (uint32_t k = 2; k < cornerCount; ++k)
+                for (uint32_t c : {0u, k - 1, k})
+                    cornerUv.push_back({faceUv[2 * c], faceUv[2 * c + 1]});
+        };
 
         if (format == PlyFormat::Ascii)
         {
@@ -375,6 +434,8 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
                 values.clear();
                 uint32_t face[256];
                 uint32_t faceCount = 0;
+                float faceUv[512];
+                uint32_t faceUvCount = 0;
                 for (size_t p = 0; p < element.properties.size(); ++p)
                 {
                     const PlyProperty& prop = element.properties[p];
@@ -385,6 +446,14 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
                         cursor = next;
                         for (unsigned long k = 0; k < count; ++k)
                         {
+                            if (int(p) == faceUvList)
+                            {
+                                const double value = std::strtod(cursor, &next);
+                                cursor = next;
+                                if (faceUvCount < 512)
+                                    faceUv[faceUvCount++] = float(value);
+                                continue;
+                            }
                             unsigned long index = std::strtoul(cursor, &next, 10);
                             cursor = next;
                             if (int(p) == faceList && faceCount < 256)
@@ -416,10 +485,15 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
                         v.ny = float(values[size_t(nrm[1])]);
                         v.nz = float(values[size_t(nrm[2])]);
                     }
+                    if (!vertexUv.empty())
+                        vertexUv[row] = {float(values[size_t(uv[0])]), float(values[size_t(uv[1])])};
                 }
                 if (isFace)
+                {
                     for (uint32_t k = 2; k < faceCount; ++k)
                         model.indices.insert(model.indices.end(), {face[0], face[k - 1], face[k]});
+                    addFaceUv(faceUv, faceUvCount, faceCount);
+                }
             }
             continue;
         }
@@ -461,6 +535,9 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
                             v.ny = float(readBinary(r + offsets[size_t(nrm[1])], props[size_t(nrm[1])].type, swap));
                             v.nz = float(readBinary(r + offsets[size_t(nrm[2])], props[size_t(nrm[2])].type, swap));
                         }
+                        if (!vertexUv.empty())
+                            vertexUv[row] = {float(readBinary(r + offsets[size_t(uv[0])], props[size_t(uv[0])].type, swap)),
+                                float(readBinary(r + offsets[size_t(uv[1])], props[size_t(uv[1])].type, swap))};
                     }
                 });
             }
@@ -471,6 +548,9 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
         // variable-size rows (lists)
         for (size_t row = 0; row < element.count; ++row)
         {
+            uint32_t faceCorners = 0;
+            float faceUv[512];
+            uint32_t faceUvCount = 0;
             for (size_t p = 0; p < element.properties.size(); ++p)
             {
                 const PlyProperty& prop = element.properties[p];
@@ -492,6 +572,11 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
                     error = "PLY binary data truncated in element " + element.name;
                     return false;
                 }
+                if (int(p) == faceUvList)
+                    for (uint32_t k = 0; k < count && faceUvCount < 512; ++k)
+                        faceUv[faceUvCount++] = float(readBinary(cursor + itemSize * k, prop.type, swap));
+                if (int(p) == faceList)
+                    faceCorners = count;
                 if (int(p) == faceList && count >= 3)
                 {
                     uint32_t first = readBinaryIndex(cursor, prop.type, swap);
@@ -505,6 +590,8 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
                 }
                 cursor += itemSize * count;
             }
+            if (isFace)
+                addFaceUv(faceUv, faceUvCount, faceCorners);
         }
     }
 
@@ -513,6 +600,10 @@ bool loadPly(const std::string& path, Model& model, bool& hasNormals, std::strin
         error = "PLY has no triangles (point clouds are not supported)";
         return false;
     }
+    if (cornerUvValid && !cornerUv.empty() && cornerUv.size() == model.indices.size())
+        splitByTexcoords(model, cornerUv);
+    else if (!vertexUv.empty())
+        model.texcoords = std::move(vertexUv);
     return true;
 }
 
@@ -530,8 +621,10 @@ bool loadObj(const std::string& path, Model& model, bool& hasNormals, std::strin
     }
 
     hasNormals = obj->normal_count > 1;
+    const bool hasTexcoords = obj->texcoord_count > 1; // index 0 is fast_obj's dummy
 
     std::vector<Vertex> corners;
+    std::vector<Texcoord> cornerUv;
     size_t indexOffset = 0;
     for (unsigned int f = 0; f < obj->face_count; ++f)
     {
@@ -551,11 +644,15 @@ bool loadObj(const std::string& path, Model& model, bool& hasNormals, std::strin
             return v;
         };
         for (unsigned int k = 2; k < faceVerts; ++k)
-        {
-            corners.push_back(corner(0));
-            corners.push_back(corner(k - 1));
-            corners.push_back(corner(k));
-        }
+            for (unsigned int c : {0u, k - 1, k})
+            {
+                corners.push_back(corner(c));
+                if (hasTexcoords)
+                {
+                    const unsigned int t = obj->indices[indexOffset + c].t;
+                    cornerUv.push_back({obj->texcoords[t * 2 + 0], obj->texcoords[t * 2 + 1]});
+                }
+            }
         indexOffset += faceVerts;
     }
     fast_obj_destroy(obj);
@@ -564,6 +661,17 @@ bool loadObj(const std::string& path, Model& model, bool& hasNormals, std::strin
     {
         error = "OBJ has no faces";
         return false;
+    }
+
+    if (hasTexcoords)
+    {
+        // corners as an unindexed triangle list; vertices are shared where position, normal and uv agree
+        model.vertices = std::move(corners);
+        model.indices.resize(model.vertices.size());
+        for (size_t i = 0; i < model.indices.size(); ++i)
+            model.indices[i] = uint32_t(i);
+        splitByTexcoords(model, cornerUv);
+        return true;
     }
 
     std::vector<unsigned int> remap(corners.size());
@@ -580,11 +688,15 @@ void computeNormals(Model& model)
     for (Vertex& v : model.vertices)
         v.nx = v.ny = v.nz = 0;
 
+    // accumulate per position, so vertices split at texture seams get the same (smooth) normal
+    std::vector<unsigned int> position(model.vertices.size());
+    meshopt_generatePositionRemap(position.data(), &model.vertices[0].px, model.vertices.size(), sizeof(Vertex));
+
     for (size_t i = 0; i < model.indices.size(); i += 3)
     {
-        Vertex& a = model.vertices[model.indices[i + 0]];
-        Vertex& b = model.vertices[model.indices[i + 1]];
-        Vertex& c = model.vertices[model.indices[i + 2]];
+        Vertex& a = model.vertices[position[model.indices[i + 0]]];
+        Vertex& b = model.vertices[position[model.indices[i + 1]]];
+        Vertex& c = model.vertices[position[model.indices[i + 2]]];
         float e1[3] = {b.px - a.px, b.py - a.py, b.pz - a.pz};
         float e2[3] = {c.px - a.px, c.py - a.py, c.pz - a.pz};
         float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
@@ -611,6 +723,15 @@ void computeNormals(Model& model)
                 v.nz = 1;
         }
     });
+    for (size_t i = 0; i < model.vertices.size(); ++i)
+        if (position[i] != i)
+        {
+            Vertex& v = model.vertices[i];
+            const Vertex& p = model.vertices[position[i]];
+            v.nx = p.nx;
+            v.ny = p.ny;
+            v.nz = p.nz;
+        }
 }
 
 bool buildSingleLevel(const Model& model, const MeshletSettings& s, size_t maxVertices, size_t minTriangles, size_t maxTriangles,

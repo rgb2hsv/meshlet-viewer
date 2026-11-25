@@ -39,6 +39,9 @@ struct DrawParams
     bool wireframe = false;
     float wireWidth = 0.f;    // triangle wireframe line width in model units (0 = off)
     float outlineWidth = 0.f; // meshlet outline width in model units (0 = off)
+    // with wireframe: a grid over the texture coordinates instead of the triangle lines (outlines stay)
+    bool uvGrid = false;
+    float uvGridCells = 16.f; // grid cells per unit of texture coordinates
     float clearColor[3] = {0.08f, 0.09f, 0.11f};
     float viewportX = 0.f; // left edge of the 3D view in framebuffer pixels (right of the sidebar)
 };
@@ -77,6 +80,8 @@ public:
     bool hasLodBvh() const { return lodNodes.buffer != VK_NULL_HANDLE; }
     // The vertex path passes barycentrics itself; the mesh path needs VK_KHR_fragment_shader_barycentric.
     bool supportsWireframe() const { return !usesMeshShaders() || ctx->caps.barycentric; }
+    // The uploaded model has texture coordinates (the UV grid can be drawn)
+    bool hasTexcoords() const { return texcoords.buffer != VK_NULL_HANDLE; }
     size_t gpuBytes() const { return sceneBytes; }
     size_t matcapCount() const { return matcapNames.size(); }
     const std::string& matcapName(size_t i) const { return matcapNames[i]; }
@@ -134,6 +139,7 @@ private:
     Buffer vertices, meshlets, meshletVertices, meshletTriangles, bounds;
     Buffer lods;
     Buffer edgeMasks;      // meshlet perimeter edges per triangle
+    Buffer texcoords;      // per vertex (models with texture coordinates only)
     uint32_t lodLevelCount = 1;
     Buffer lodNodes, lodGroups;              // BVH (cluster LOD builds only)
     uint32_t lodRootCount = 0;

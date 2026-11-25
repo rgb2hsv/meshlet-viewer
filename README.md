@@ -9,11 +9,16 @@ The UI is a Dear ImGui sidebar on the left (on GLFW); drag its right edge to res
 
 - Task shader: per-meshlet frustum and normal-cone (backface) culling
 - Mesh shader: one workgroup per meshlet, up to 256 vertices / 256 triangles
-- Meshlets colored with a gradient by LOD level (blue = full detail to orange = coarsest), or by
+- Meshlets colored by LOD level with a CIELAB palette: lightness falls in even L* steps from full detail (pale yellow) to coarsest (red), with the hue turning between, so levels stay distinct and bright behind the black wireframe; the Level of detail table shows each color, or by
   triangle or normal, or Shaded with any of Blender's matcaps (thumbnail selector)
 - Black outlines around each meshlet's perimeter plus a thinner triangle wireframe (on by
   default), drawn in the fragment shader with widths in model units: they scale with the mesh,
   not the screen, and are anti-aliased, fading out when thinner than a pixel
+- UV grid (`--uv-grid`, "UV grid" in the Rendering section): for models with texture coordinates,
+  a grid over the UVs (`--uv-grid-cells N` per UV unit, with a faint checker) replaces the triangle
+  wireframe while the meshlet outlines stay. UVs load from PLY (per-vertex `u`/`v`, `s`/`t` or
+  `texture_u`/`texture_v`, or per-corner face `texcoord` lists as MeshLab writes them), OBJ and
+  version 2 `.mlod` files, and are passed on to meshlet-optimizer
 - Meshlet inspector: highlight one meshlet by index
 - Meshlet builders: `buildMeshlets`, `buildMeshletsFlex`, `buildMeshletsSpatial`, `buildMeshletsScan`
 - Cluster LOD (Nanite-style, on by default; `--no-lod` for a single meshlet level) with meshoptimizer's `demo/clusterlod.h`: a DAG of progressively
@@ -55,6 +60,7 @@ cmake --build build
 ./build/meshlets --lod-sweep           # step through the levels and back ("Sweep levels" in the sidebar)
 ./build/meshlets --save-lod model.mlod  # save the mesh + meshlet hierarchy once it is built
 ./build/meshlets model.mlod            # load it back: no rebuild
+./build/meshlets --lod-source meshlet-optimizer   # build the hierarchy with meshlet-optimizer
 ./build/meshlets --help                # all options
 ```
 
@@ -66,6 +72,27 @@ Pass it as the model, or drop it onto the window, to show the hierarchy without 
 sidebar then shows the settings it was built with, and changing them rebuilds from the saved mesh.
 The file is cereal's portable binary archive, so it reads on machines of either endianness; a
 version number guards against files from an incompatible build.
+
+## LOD sources
+
+The sidebar's first section, **LOD source**, picks where the hierarchy comes from. Each source has
+its own input file and settings:
+
+- **meshoptimizer (mesh file)**: a `.ply`/`.obj` built with meshoptimizer's `clusterlod.h` (or one
+  meshlet level with "Build LOD hierarchy" off). Builds take seconds and rerun as settings change.
+- **meshlet-optimizer (mesh file)**: a `.ply`/`.obj` built by meshlet-optimizer
+  (`external/meshlet-optimizer`): CVT charts, then levels of clustered, flattened and remeshed
+  regions. CMake builds the tool alongside the viewer (`ExternalProject`, always Release); the
+  viewer writes the mesh to a temporary PLY, runs the tool as a child process and loads the `.mlod`
+  it writes. A build takes about half a minute on the metasphere, so settings apply with the Build
+  button. Command line: `--lod-source meshlet-optimizer`, `--mopt-chart-triangles`,
+  `--mopt-stop-at-regions`, `--mopt-max-depth`, `--mopt-interior-fraction`, `--mopt-threads`, and
+  `--meshlet-optimizer PATH` to run another build of the tool.
+- **Loaded from file (.mlod)**: a saved hierarchy, shown as it was built.
+
+Passing a file on the command line or dropping it onto the window selects the source: a `.mlod`
+selects the file source; a mesh selects the mesh builder used last (`--lod-source` on the command
+line). Switching to a mesh builder while a `.mlod` is shown rebuilds from the mesh inside it.
 
 Mouse: left-drag to orbit, Shift+left-drag or middle-drag to pan, right-drag or the
 wheel to zoom. "Auto-rotate" (or `--auto-rotate`, `--rotate-speed DEG`) turns the object about

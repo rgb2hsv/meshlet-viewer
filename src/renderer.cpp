@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include "lod_palette.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -35,7 +36,7 @@ struct GpuGlobals
     float wireWidth;
     int32_t matcap;
     float outlineWidth;
-    float pad;
+    float uvGridCells;
     float viewRight[4];
     float viewUp[4];
     float viewBack[4];
@@ -53,14 +54,17 @@ struct GpuGlobals
     uint32_t lodRootCount;
     uint32_t lodLevelCount;
     uint32_t pad3[2];
+    float levelColors[kMaxLodLevels][4]; // sRGB-encoded, lod_palette::levelColor
 };
-static_assert(sizeof(GpuGlobals) == 336, "GpuGlobals layout mismatch");
+static_assert(sizeof(GpuGlobals) == 336 + kMaxLodLevels * 16, "GpuGlobals layout mismatch");
+static_assert(offsetof(GpuGlobals, levelColors) == 336, "GpuGlobals layout mismatch");
 static_assert(offsetof(GpuGlobals, lodNodes) == 272, "GpuGlobals layout mismatch");
 
 constexpr uint32_t kMaxBvhDepth = 64;    // MAX_BVH_DEPTH in common.glsl
 constexpr uint32_t kBvhGroupSize = 64;   // BVH_GROUP_SIZE
 constexpr uint32_t kFlagLodCandidates = 8; // FLAG_LOD_CANDIDATES
 constexpr uint32_t kFlagPreview = 16;      // FLAG_PREVIEW
+constexpr uint32_t kFlagUvGrid = 32;       // FLAG_UV_GRID
 
 // Must match TraversalBuffer in shaders/common.glsl
 struct GpuTraversal
@@ -86,6 +90,7 @@ struct PushConstants
     VkDeviceAddress stats;
     VkDeviceAddress lods;
     VkDeviceAddress edgeMasks;
+    VkDeviceAddress texcoords;
     uint32_t traversalDepth;
     uint32_t padding;
 };
@@ -362,6 +367,8 @@ void MeshletRenderer::upload(const Model& model, const MeshletData& data)
 
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     vertices = ctx->createDeviceBuffer(model.vertices.data(), model.vertices.size() * sizeof(Vertex), usage);
+    if (!model.texcoords.empty() && model.texcoords.size() == model.vertices.size())
+        texcoords = ctx->createDeviceBuffer(model.texcoords.data(), model.texcoords.size() * sizeof(Texcoord), usage);
 
     if (usesMeshShaders())
     {
@@ -425,7 +432,7 @@ void MeshletRenderer::upload(const Model& model, const MeshletData& data)
     lodLevelCount = uint32_t(std::max<size_t>(1, data.levelClusters.size()));
     triangleCount = uint32_t(data.triangleCount);
     sceneBytes = size_t(vertices.size + meshlets.size + meshletVertices.size + meshletTriangles.size + bounds.size + lods.size + edgeMasks.size +
-                        fallbackIndices.size + fallbackTriangles.size);
+                        fallbackIndices.size + fallbackTriangles.size + texcoords.size);
 }
 
 void MeshletRenderer::uploadPreview(const Model& model)
@@ -437,9 +444,11 @@ void MeshletRenderer::uploadPreview(const Model& model)
     const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     vertices = ctx->createDeviceBuffer(model.vertices.data(), model.vertices.size() * sizeof(Vertex), usage);
     fallbackIndices = ctx->createDeviceBuffer(model.indices.data(), model.indices.size() * sizeof(uint32_t), usage);
+    if (!model.texcoords.empty() && model.texcoords.size() == model.vertices.size())
+        texcoords = ctx->createDeviceBuffer(model.texcoords.data(), model.texcoords.size() * sizeof(Texcoord), usage);
     previewTriangleCount = uint32_t(model.indices.size() / 3);
     triangleCount = previewTriangleCount;
-    sceneBytes = size_t(vertices.size + fallbackIndices.size);
+    sceneBytes = size_t(vertices.size + fallbackIndices.size + texcoords.size);
 }
 
 void MeshletRenderer::releaseScene()
@@ -449,7 +458,7 @@ void MeshletRenderer::releaseScene()
     if (vertices.buffer)
         VK_CHECK(vkDeviceWaitIdle(ctx->device));
     for (Buffer* buffer : {&vertices, &meshlets, &meshletVertices, &meshletTriangles, &bounds, &lods, &lodNodes, &lodGroups, &edgeMasks,
-             &fallbackIndices, &fallbackTriangles})
+             &fallbackIndices, &fallbackTriangles, &texcoords})
         ctx->destroyBuffer(*buffer);
     for (PerFrame& frame : frames)
     {
@@ -509,10 +518,18 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     globals.mode = uint32_t(params.mode);
     globals.highlight = params.highlight;
     const bool wireframe = params.wireframe && (params.wireWidth > 0.f || params.outlineWidth > 0.f) && supportsWireframe();
-    globals.flags = (params.frustumCull ? 1u : 0u) | (params.coneCull ? 2u : 0u) | (wireframe ? 4u : 0u);
-    globals.wireWidth = params.wireWidth;
+    const bool uvGrid = params.wireframe && params.uvGrid && hasTexcoords();
+    globals.flags = (params.frustumCull ? 1u : 0u) | (params.coneCull ? 2u : 0u) | (wireframe ? 4u : 0u) | (uvGrid ? kFlagUvGrid : 0u);
+    globals.wireWidth = uvGrid ? 0.f : params.wireWidth; // the grid replaces the triangle lines
+    globals.uvGridCells = params.uvGridCells;
     globals.outlineWidth = params.outlineWidth;
     globals.lodLevelCount = lodLevelCount;
+    for (uint32_t level = 0; level < kMaxLodLevels; ++level)
+    {
+        const std::array<float, 3> c = lod_palette::levelColor(level, std::min(lodLevelCount, kMaxLodLevels));
+        std::copy(c.begin(), c.end(), globals.levelColors[level]);
+        globals.levelColors[level][3] = 1.f;
+    }
     globals.matcap = params.matcap >= 0 && size_t(params.matcap) < matcapNames.size() ? params.matcap : -1;
     Eigen::Map<Eigen::Vector3f>(globals.viewRight) = params.viewRight;
     Eigen::Map<Eigen::Vector3f>(globals.viewUp) = params.viewUp;
@@ -577,6 +594,7 @@ void MeshletRenderer::begin(VkCommandBuffer cmd, uint32_t frameIndex, uint32_t i
     push.stats = frame.stats.address;
     push.lods = lods.address;
     push.edgeMasks = edgeMasks.address;
+    push.texcoords = texcoords.address;
 
     if (useBvh)
     {

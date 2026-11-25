@@ -1,7 +1,10 @@
-// meshlets: load a PLY/OBJ model, split it into meshlets with meshoptimizer and
-// visualize them with Vulkan mesh shaders (vertex-shader fallback) + Dear ImGui.
+// meshlets: load a PLY/OBJ model, build its meshlet LOD hierarchy with meshoptimizer or
+// meshlet-optimizer (or load a saved one from a .mlod file) and visualize it with Vulkan mesh
+// shaders (vertex-shader fallback) + Dear ImGui.
 #include "matcap.h"
 #include "meshlet_file.h"
+#include "meshlet_optimizer.h"
+#include "lod_palette.h"
 #include "camera_math.h"
 #include "model.h"
 #include "renderer.h"
@@ -13,6 +16,7 @@
 #include <imgui_impl_vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cfloat>
@@ -20,6 +24,7 @@
 #include <filesystem>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -169,12 +174,42 @@ struct Camera
 // --------------------------------------------------------------------------
 struct JobResult
 {
-    std::shared_ptr<Model> model; // non-null when a new model was loaded
+    std::shared_ptr<Model> model; // non-null when a new model was loaded (or a build replaced it)
     std::shared_ptr<MeshletData> meshlets;
     MeshletSettings settings; // what meshlets were built with
     std::string error;
     std::string message; // status line for jobs that load or build nothing (saving)
     bool save = false;
+    std::string savedPath; // the .mlod a save wrote
+    bool fromFile = false; // model + meshlets loaded from a .mlod file
+    bool rebuilt = false;  // a build of the current mesh: model replaces the shown one, the view stays
+    const char* builder = nullptr; // set by builds: which LOD source built the meshlets
+};
+
+// Where the meshlet LOD hierarchy comes from (the sidebar's "LOD source")
+enum class LodSource : int
+{
+    Meshoptimizer = 0,    // built from the mesh with meshoptimizer (clusterlod.h, or one meshlet level)
+    MeshletOptimizer = 1, // built from the mesh by external/meshlet-optimizer (child process)
+    File = 2,             // loaded from a .mlod file
+};
+const char* const kLodSourceNames[] = {"meshoptimizer (mesh file)", "meshlet-optimizer (mesh file)", "Loaded from file (.mlod)"};
+
+// Latest progress line of a running job, written by the job's thread
+struct JobProgress
+{
+    std::mutex mutex;
+    std::string line;
+    void set(const std::string& text)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        line = text;
+    }
+    std::string get()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return line;
+    }
 };
 
 struct App
@@ -186,6 +221,24 @@ struct App
     std::shared_ptr<Model> model;
     std::shared_ptr<MeshletData> meshlets;
     MeshletSettings settings;
+
+    // LOD source. Loading a .mlod selects File; loading a mesh selects meshSource (the mesh builder
+    // used last). sourceModel is the mesh the builders start from: the loaded mesh file, or the mesh
+    // inside the loaded .mlod (meshlet-optimizer replaces the shown model with its own vertices).
+    LodSource lodSource = LodSource::Meshoptimizer;
+    LodSource meshSource = LodSource::Meshoptimizer;
+    std::shared_ptr<Model> sourceModel;
+    // Each LOD source has its own input file (a mesh for the builders, a .mlod for File), shown and
+    // edited in that source's panel
+    char sourcePaths[3][1024] = {};
+    char* sourcePath(LodSource source) { return sourcePaths[int(source)]; }
+    void setSourcePath(LodSource source, const std::string& path)
+    {
+        std::snprintf(sourcePath(source), sizeof(sourcePaths[0]), "%s", path.c_str());
+    }
+    MeshletOptimizerParams moptParams;
+    std::string moptExe = defaultMeshletOptimizerPath();
+    std::shared_ptr<JobProgress> jobProgress;
     bool optimizeVertexCache = true;
     bool autoRebuild = true;
     bool rebuildPending = false;
@@ -210,7 +263,6 @@ struct App
     std::string status;
     bool statusIsError = false;
 
-    char pathInput[1024] = {};
     char savePathInput[1024] = {};
 
     DrawParams draw;
@@ -315,15 +367,18 @@ struct App
             return;
         }
         pendingLoad.clear();
-        std::snprintf(pathInput, sizeof(pathInput), "%s", path.c_str());
+        setSourcePath(isMeshletFile(path) ? LodSource::File : meshSource, path);
         jobLabel = "Loading " + fileName(path);
         jobStart = Clock::now();
+        jobProgress.reset();
         bool vcache = optimizeVertexCache;
         if (isMeshletFile(path))
         {
             // a saved hierarchy: mesh + meshlets in one file, nothing to build
+            lodSource = LodSource::File;
             job = std::async(std::launch::async, [path] {
                 JobResult result;
+                result.fromFile = true;
                 auto loaded = std::make_shared<Model>();
                 auto data = std::make_shared<MeshletData>();
                 if (loadMeshletFile(path, *loaded, result.settings, *data, result.error))
@@ -335,6 +390,7 @@ struct App
             });
             return;
         }
+        lodSource = meshSource; // a mesh file: build it with the mesh builder used last
         // loads only; finishJob() shows the raw mesh and then starts building the meshlets
         job = std::async(std::launch::async, [path, vcache] {
             JobResult result;
@@ -355,6 +411,7 @@ struct App
         std::shared_ptr<const Model> m = model;
         std::shared_ptr<const MeshletData> d = meshlets;
         MeshletSettings s = builtSettings;
+        jobProgress.reset();
         Clock::time_point start = jobStart;
         job = std::async(std::launch::async, [path, m, d, s, start] {
             JobResult result;
@@ -365,15 +422,42 @@ struct App
                 std::snprintf(buf, sizeof(buf), "Saved %s in %.2fs", fileName(path).c_str(),
                     std::chrono::duration<double>(Clock::now() - start).count());
                 result.message = buf;
+                result.savedPath = path;
             }
             return result;
         });
     }
 
+    // Switches the LOD source from the sidebar. File loads its .mlod. A mesh builder loads its mesh
+    // file, or rebuilds the current mesh when that is its file (or it has none: e.g. the mesh of a .mlod).
+    void setLodSource(LodSource source)
+    {
+        if (source == lodSource)
+            return;
+        lodSource = source;
+        const std::string path = sourcePath(source);
+        if (source == LodSource::File)
+        {
+            if (!path.empty())
+                startLoad(path);
+            return;
+        }
+        meshSource = source;
+        if (path.empty() && sourceModel && !isMeshletFile(sourceModel->path))
+            setSourcePath(source, sourceModel->path); // both builders start from the same mesh
+        if (!sourcePath(source)[0] || (sourceModel && sourceModel->path == sourcePath(source)))
+            startBuild();
+        else
+            startLoad(sourcePath(source));
+    }
+
     void startBuild()
     {
-        if (!model)
+        if (!sourceModel || lodSource == LodSource::File)
+        {
+            rebuildPending = false;
             return;
+        }
         if (!pendingLoad.empty())
         {
             // another model is about to replace this one: don't build meshlets for it
@@ -386,16 +470,46 @@ struct App
             return;
         }
         rebuildPending = false;
-        jobLabel = "Building meshlets";
         jobStart = Clock::now();
-        std::shared_ptr<const Model> m = model;
+        std::shared_ptr<Model> m = sourceModel;
+        if (lodSource == LodSource::MeshletOptimizer)
+        {
+            jobLabel = "Building with meshlet-optimizer";
+            auto progress = std::make_shared<JobProgress>();
+            jobProgress = progress;
+            const MeshletOptimizerParams p = moptParams;
+            const std::string exe = moptExe;
+            job = std::async(std::launch::async, [m, p, exe, progress] {
+                JobResult result;
+                result.rebuilt = true;
+                result.builder = "meshlet-optimizer";
+                auto built = std::make_shared<Model>();
+                auto data = std::make_shared<MeshletData>();
+                if (runMeshletOptimizer(exe, *m, p, *built, result.settings, *data, result.error,
+                        [&progress](const std::string& line) { progress->set(line); }))
+                {
+                    built->loadSeconds = m->loadSeconds;
+                    result.model = built;
+                    result.meshlets = data;
+                }
+                return result;
+            });
+            return;
+        }
+        jobLabel = "Building meshlets";
+        jobProgress.reset();
         MeshletSettings s = settings;
         job = std::async(std::launch::async, [m, s] {
             JobResult result;
             result.settings = s;
+            result.rebuilt = true;
+            result.builder = "meshoptimizer";
             auto built = std::make_shared<MeshletData>();
             if (buildMeshlets(*m, s, *built, result.error))
+            {
+                result.model = m; // the source mesh, in case meshlet-optimizer's model is shown
                 result.meshlets = built;
+            }
             return result;
         });
     }
@@ -425,14 +539,25 @@ struct App
         {
             status = result.message;
             statusIsError = false;
+            setSourcePath(LodSource::File, result.savedPath); // "Loaded from file" now loads what was just saved
             std::printf("%s\n", result.message.c_str());
             std::fflush(stdout);
         }
         else
         {
-            if (result.model)
+            if (result.model && result.rebuilt)
+            {
+                // a build of the shown mesh: same object, keep the view
+                if (result.model != model)
+                {
+                    model = result.model;
+                    draw.highlight = -1;
+                }
+            }
+            else if (result.model)
             {
                 model = result.model;
+                sourceModel = result.model;
                 camera.frame(*model);
                 camera.distance /= initialZoom;
                 if (firstLoad)
@@ -457,13 +582,13 @@ struct App
                 std::snprintf(savePathInput, sizeof(savePathInput), "%s",
                     std::filesystem::path(model->path).replace_extension(kMeshletFileExtension).string().c_str());
             }
-            if (result.model && result.meshlets)
+            if (result.fromFile && result.meshlets)
             {
                 // loaded from a .mlod file: show its settings in the sidebar, skip building
                 settings = result.settings;
                 rebuildPending = false;
             }
-            else if (result.model)
+            else if (result.model && !result.rebuilt)
             {
                 // show the raw mesh (matcap shaded, no wireframe) while its meshlets are built
                 meshlets.reset();
@@ -476,14 +601,17 @@ struct App
             }
             meshlets = result.meshlets;
             builtSettings = result.settings;
-            const bool fromFile = result.model != nullptr;
+            const bool fromFile = result.fromFile;
             draw.highlight = std::min(draw.highlight, int(meshlets->meshlets.size()) - 1);
             renderer.upload(*model, *meshlets);
 
             const MeshletData& m = *meshlets;
             const char* algorithmNames[] = {"greedy", "flex", "spatial", "scan"};
             const MeshletSettings& bs = builtSettings;
-            const char* builder = m.lod ? (bs.lodSpatial ? "lod-spatial" : "lod-flex") : algorithmNames[int(bs.algorithm)];
+            const bool otherBuilder = result.builder && std::strcmp(result.builder, "meshoptimizer") != 0;
+            const char* builder = otherBuilder ? result.builder
+                                  : m.lod      ? (bs.lodSpatial ? "lod-spatial" : "lod-flex")
+                                               : algorithmNames[int(bs.algorithm)];
             std::printf("%s: %zu vertices, %zu triangles, avg edge %.4g | %s v%d t%d -> %zu meshlets, avg %.1f verts / %.1f tris, "
                         "cone-cullable %.0f%%, build %.2fs\n",
                 fileName(model->path).c_str(), model->vertices.size(), model->indices.size() / 3, model->avgEdgeLength, builder,
@@ -536,6 +664,9 @@ struct App
     }
 
     void ui();
+    void meshletOptimizerUi();
+    void lodFileUi();
+    void sourcePathInput(LodSource source, const char* hint);
     void progressOverlay();
 };
 
@@ -550,12 +681,14 @@ void App::progressOverlay()
     if (viewWidth <= 0.f)
         return;
     const double elapsed = std::chrono::duration<double>(Clock::now() - jobStart).count();
-    char text[256];
+    char text[512];
     const std::string next = pendingLoad.empty() ? std::string() : ", then opening " + fileName(pendingLoad);
-    std::snprintf(text, sizeof(text), "%s... %.1fs%s", jobLabel.c_str(), elapsed, next.c_str());
+    const std::string stage = jobProgress ? jobProgress->get() : std::string();
+    const std::string stageLine = stage.empty() ? std::string() : "\n" + stage; // the tool's latest output line
+    std::snprintf(text, sizeof(text), "%s... %.1fs%s%s", jobLabel.c_str(), elapsed, next.c_str(), stageLine.c_str());
     // size from a fixed-width elapsed time so the panel doesn't jitter as the digits change
-    char sizing[256];
-    std::snprintf(sizing, sizeof(sizing), "%s... 00.0s%s", jobLabel.c_str(), next.c_str());
+    char sizing[512];
+    std::snprintf(sizing, sizeof(sizing), "%s... 00.0s%s%s", jobLabel.c_str(), next.c_str(), stageLine.c_str());
     const ImVec2 textSize = ImGui::CalcTextSize(text), sizingSize = ImGui::CalcTextSize(sizing);
     const ImVec2 size(std::max(textSize.x, sizingSize.x), textSize.y);
     const ImVec2 at(std::floor(viewLeft + 0.5f * (viewWidth - size.x)), std::floor(0.5f * (io.DisplaySize.y - size.y)));
@@ -563,6 +696,108 @@ void App::progressOverlay()
     ImDrawList* drawList = ImGui::GetBackgroundDrawList();
     drawList->AddRectFilled(ImVec2(at.x - pad.x, at.y - pad.y), ImVec2(at.x + size.x + pad.x, at.y + size.y + pad.y), IM_COL32(0, 0, 0, 170), 6.f);
     drawList->AddText(at, IM_COL32(255, 220, 120, 255), text);
+}
+
+// Settings of the meshlet-optimizer LOD source. A build takes about a minute, so changes apply
+// with the Build button only.
+void App::meshletOptimizerUi()
+{
+    if (moptExe.empty())
+    {
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "meshlet-optimizer was not built with this viewer");
+        ImGui::TextDisabled("git submodule update --init --recursive, then rebuild");
+        return;
+    }
+    sourcePathInput(LodSource::MeshletOptimizer, "path/to/mesh.ply or .obj");
+    MeshletOptimizerParams& p = moptParams;
+    auto tip = [](const char* text) {
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", text);
+    };
+    auto seed = [](const char* label, uint32_t& value) {
+        int v = int(value);
+        if (ImGui::InputInt(label, &v))
+            value = uint32_t(std::max(v, 0));
+    };
+
+    ImGui::TextDisabled("Base charts");
+    ImGui::SliderInt("Chart triangles", &p.chartTriangles, 16, 256);
+    tip("Largest base chart (level 0 meshlet), in triangles touching it");
+    seed("Chart seed", p.cvtSeed);
+    tip("Seed of the blue-noise chart seeds of the CVT");
+    ImGui::Checkbox("Regularize charts", &p.regularize);
+    tip("Opening, region competition and disk splitting of the base charts");
+
+    ImGui::TextDisabled("Hierarchy");
+    ImGui::SliderInt("Max clique", &p.maxClique, 2, 8);
+    tip("Most regions merged into one per level");
+    ImGui::SliderInt("Stop at regions", &p.stopAtRegions, 1, 64);
+    tip("Stop once the top level has at most this many regions");
+    ImGui::SliderInt("Max depth", &p.maxDepth, 1, 24);
+    tip("Most clustering passes (levels above the base)");
+    seed("Clustering seed", p.seed);
+    ImGui::Checkbox("Disk-shaped groups", &p.keepDisks);
+    ImGui::SameLine();
+    ImGui::Checkbox("Straighten seams", &p.straightenSeams);
+    tip("Straighten the base charts' borders along mesh edges");
+
+    ImGui::TextDisabled("Remeshing");
+    ImGui::SliderFloat("Interior kept", &p.interiorFraction, 0.05f, 1.f, "%.2f");
+    tip("Interior vertices kept per region and level");
+    ImGui::SliderInt("Split above", &p.splitAboveFaces, 0, 1024, p.splitAboveFaces == 0 ? "never" : "%d tris");
+    tip("Split remeshed regions with more triangles in two (0: never)");
+    ImGui::Checkbox("Project onto input", &p.project);
+    tip("Snap new vertices onto the input surface");
+
+    ImGui::TextDisabled("Region borders");
+    ImGui::Checkbox("Simplify borders", &p.simplifyBorders);
+    tip("Coarsen each level's region borders (also enables the flat-triangle fix and relaxation)");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!p.simplifyBorders);
+    ImGui::Checkbox("Relax borders", &p.relaxBorders);
+    ImGui::EndDisabled();
+
+    ImGui::SliderInt("Threads", &p.threads, 0, 64, p.threads == 0 ? "all cores" : "%d");
+
+    ImGui::BeginDisabled(!sourceModel);
+    if (ImGui::Button("Build", ImVec2(120, 0)))
+        startBuild();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Defaults"))
+        p = MeshletOptimizerParams();
+    const std::string args = meshletOptimizerArgs(p);
+    ImGui::TextDisabled("Runs: meshlet-optimizer %s", args.empty() ? "(defaults)" : args.c_str());
+}
+
+// The input file of a LOD source: path field + Load (queued while a job runs). Mesh builders
+// rebuild on Load even when the file is already shown.
+void App::sourcePathInput(LodSource source, const char* hint)
+{
+    ImGui::PushID(int(source));
+    ImGui::SetNextItemWidth(-60);
+    const bool enter =
+        ImGui::InputTextWithHint("##path", hint, sourcePath(source), sizeof(sourcePaths[0]), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if ((ImGui::Button("Load", ImVec2(-1, 0)) || enter) && sourcePath(source)[0])
+        startLoad(sourcePath(source));
+    ImGui::PopID();
+    if (source != LodSource::File && sourceModel && sourceModel->path != sourcePath(source))
+        ImGui::TextDisabled("Building from the mesh of %s", fileName(sourceModel->path).c_str());
+}
+
+// The loaded .mlod file: its hierarchy is shown as it was built; nothing to set
+void App::lodFileUi()
+{
+    sourcePathInput(LodSource::File, "path/to/model.mlod");
+    if (!model || model->path != sourcePath(LodSource::File))
+        return;
+    const MeshletSettings& s = builtSettings;
+    if (meshlets && meshlets->lod)
+        ImGui::TextDisabled("Up to %d vertices / %d triangles per meshlet", s.maxVertices, s.maxTriangles);
+    else if (meshlets)
+        ImGui::TextDisabled("Single meshlet level, up to %d vertices / %d triangles", s.maxVertices, s.maxTriangles);
+    ImGui::TextDisabled("A mesh builder above rebuilds from its mesh");
 }
 
 void App::ui()
@@ -591,18 +826,157 @@ void App::ui()
 
     ImGui::TextUnformatted("Meshlets");
     ImGui::SameLine();
-    ImGui::TextDisabled("meshoptimizer + Vulkan mesh shaders");
+    ImGui::TextDisabled("meshlet LODs + Vulkan mesh shaders");
+
+    // ---- LOD source ----
+    if (section("LOD source"))
+    {
+        // where the hierarchy comes from; each source shows its own settings below
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##lodsource", kLodSourceNames[int(lodSource)]))
+        {
+            for (int i = 0; i < IM_ARRAYSIZE(kLodSourceNames); ++i)
+            {
+                const LodSource source = LodSource(i);
+                const bool unavailable = source == LodSource::MeshletOptimizer && moptExe.empty();
+                if (ImGui::Selectable(kLodSourceNames[i], source == lodSource, unavailable ? ImGuiSelectableFlags_Disabled : 0))
+                    setLodSource(source);
+                if (unavailable && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("meshlet-optimizer was not built with this viewer:\n"
+                                      "run git submodule update --init --recursive and rebuild");
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("meshoptimizer: cluster LOD DAG (clusterlod.h) or single-level meshlets, built in a few seconds\n"
+                              "meshlet-optimizer: CVT charts, then levels of clustered, flattened and remeshed regions\n"
+                              "    (external/meshlet-optimizer, run as a separate process; about a minute)\n"
+                              "Loaded from file: a saved .mlod hierarchy, shown as it was built\n"
+                              "Loading or dropping a .mlod selects the file; a mesh selects the mesh builder used last");
+
+        if (lodSource == LodSource::Meshoptimizer)
+        {
+            sourcePathInput(LodSource::Meshoptimizer, "path/to/mesh.ply or .obj");
+            ImGui::Checkbox("Optimize vertex cache on load", &optimizeVertexCache);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("meshopt_optimizeVertexCache on the index buffer when the mesh file loads");
+            bool changed = false;
+            changed |= ImGui::Checkbox("Build LOD hierarchy", &settings.lod);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Cluster LOD DAG (meshoptimizer clusterlod.h): groups of clusters are simplified\n"
+                                  "level by level; the task shader picks a crack-free cut per frame");
+
+            if (settings.lod)
+            {
+                // clusterlod.h builds its own clusters with the flex or spatial builder
+                int clusterizer = settings.lodSpatial ? 1 : 0;
+                const char* clusterizers[] = {"buildMeshletsFlex", "buildMeshletsSpatial (RT)"};
+                if (ImGui::Combo("Clusterizer", &clusterizer, clusterizers, IM_ARRAYSIZE(clusterizers)))
+                {
+                    settings.lodSpatial = clusterizer == 1;
+                    changed = true;
+                }
+            }
+            else
+            {
+                const char* algorithms[] = {"buildMeshlets (greedy)", "buildMeshletsFlex", "buildMeshletsSpatial (RT)", "buildMeshletsScan (fast)"};
+                int algorithm = int(settings.algorithm);
+                if (ImGui::Combo("Algorithm", &algorithm, algorithms, IM_ARRAYSIZE(algorithms)))
+                {
+                    settings.algorithm = MeshletAlgorithm(algorithm);
+                    changed = true;
+                }
+            }
+
+            ImGui::SliderInt("Max vertices", &settings.maxVertices, 3, maxVertexLimit());
+            changed |= ImGui::IsItemDeactivatedAfterEdit();
+            ImGui::SliderInt("Max triangles", &settings.maxTriangles, 4, maxTriangleLimit());
+            changed |= ImGui::IsItemDeactivatedAfterEdit();
+
+            const bool flex = settings.lod ? !settings.lodSpatial : settings.algorithm == MeshletAlgorithm::Flex;
+            const bool spatial = settings.lod ? settings.lodSpatial : settings.algorithm == MeshletAlgorithm::Spatial;
+            if (flex || spatial)
+            {
+                ImGui::SliderInt("Min triangles", &settings.minTriangles, 1, settings.maxTriangles);
+                changed |= ImGui::IsItemDeactivatedAfterEdit();
+            }
+            if (!settings.lod && (settings.algorithm == MeshletAlgorithm::Greedy || flex))
+            {
+                ImGui::SliderFloat("Cone weight", &settings.coneWeight, 0.f, 1.f);
+                changed |= ImGui::IsItemDeactivatedAfterEdit();
+            }
+            if (flex)
+            {
+                ImGui::SliderFloat("Split factor", &settings.splitFactor, 0.f, 4.f);
+                changed |= ImGui::IsItemDeactivatedAfterEdit();
+            }
+            if (spatial)
+            {
+                ImGui::SliderFloat("Fill weight", &settings.fillWeight, 0.f, 1.f);
+                changed |= ImGui::IsItemDeactivatedAfterEdit();
+            }
+            if (settings.lod)
+            {
+                ImGui::SliderFloat("Simplify ratio", &settings.lodSimplifyRatio, 0.1f, 0.9f, "%.2f");
+                changed |= ImGui::IsItemDeactivatedAfterEdit();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Target triangle count of each level relative to the previous one");
+                ImGui::SliderInt("Partition size", &settings.lodPartitionSize, 2, 64);
+                changed |= ImGui::IsItemDeactivatedAfterEdit();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Clusters per group that are simplified together (larger: fewer levels, slower build)");
+            }
+            changed |= ImGui::Checkbox("optimizeMeshlet", &settings.optimize);
+
+            settings.maxTriangles = std::clamp(settings.maxTriangles, 4, maxTriangleLimit());
+            settings.minTriangles = std::clamp(settings.minTriangles, 1, settings.maxTriangles);
+
+            ImGui::Checkbox("Auto rebuild", &autoRebuild);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!sourceModel);
+            if (ImGui::Button("Build now"))
+                startBuild();
+            ImGui::EndDisabled();
+            if (changed && autoRebuild)
+                startBuild();
+        }
+        else if (lodSource == LodSource::MeshletOptimizer)
+            meshletOptimizerUi();
+        else
+            lodFileUi();
+
+
+        if (meshlets)
+        {
+            const MeshletData& m = *meshlets;
+            if (ImGui::BeginTable("meshletstats", 2, ImGuiTableFlags_SizingStretchProp))
+            {
+                auto row = [](const char* label, const char* fmt, auto... args) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", label);
+                    ImGui::TableNextColumn();
+                    ImGui::Text(fmt, args...);
+                };
+                if (m.lod)
+                    row("Clusters", "%s in %zu levels (%s level 0)", formatCount(m.meshlets.size()).c_str(), m.levelClusters.size(),
+                        formatCount(m.levelClusters[0]).c_str());
+                else
+                    row("Meshlets", "%s", formatCount(m.meshlets.size()).c_str());
+                row("Avg vertices", "%.1f (%.0f%% of max)", m.avgVertices, m.vertexFill * 100.f);
+                row("Avg triangles", "%.1f (%.0f%% of max)", m.avgTriangles, m.triangleFill * 100.f);
+                row("Vertex refs / vertex", "%.2f", model ? double(m.vertices.size()) / double(model->vertices.size()) : 0.0);
+                row("Cone-cullable", "%.0f%% (avg spread %.0f deg)", 100.0 * double(m.coneCullableFraction), m.avgConeAngleDeg);
+                row("Build time", "%.2f s", m.buildSeconds);
+                ImGui::EndTable();
+            }
+        }
+    }
 
     // ---- Model ----
     if (section("Model"))
     {
-        ImGui::SetNextItemWidth(-60);
-        bool enter = ImGui::InputTextWithHint("##path", "path/to/model.ply", pathInput, sizeof(pathInput), ImGuiInputTextFlags_EnterReturnsTrue);
-        ImGui::SameLine();
-        if ((ImGui::Button("Load", ImVec2(-1, 0)) || enter) && pathInput[0])
-            startLoad(pathInput); // queued if a job is running
-        ImGui::TextDisabled("Tip: drag & drop a .ply/.obj/.mlod onto the window");
-        ImGui::Checkbox("Optimize vertex cache on load", &optimizeVertexCache);
+        ImGui::TextDisabled("Drop a .ply/.obj/.mlod onto the window to load it");
 
         if (model)
         {
@@ -668,116 +1042,6 @@ void App::ui()
             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
                 ImGui::SetTooltip("Save the mesh and its meshlet LOD hierarchy as one .mlod file (cereal portable binary);\n"
                                   "load or drop the .mlod later to skip loading and building");
-        }
-    }
-
-    // ---- Meshlet builder ----
-    if (section("Meshlet builder"))
-    {
-        bool changed = false;
-        changed |= ImGui::Checkbox("Build LOD hierarchy", &settings.lod);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Cluster LOD DAG (meshoptimizer clusterlod.h): groups of clusters are simplified\n"
-                              "level by level; the task shader picks a crack-free cut per frame");
-
-        if (settings.lod)
-        {
-            // clusterlod.h builds its own clusters with the flex or spatial builder
-            int clusterizer = settings.lodSpatial ? 1 : 0;
-            const char* clusterizers[] = {"buildMeshletsFlex", "buildMeshletsSpatial (RT)"};
-            if (ImGui::Combo("Clusterizer", &clusterizer, clusterizers, IM_ARRAYSIZE(clusterizers)))
-            {
-                settings.lodSpatial = clusterizer == 1;
-                changed = true;
-            }
-        }
-        else
-        {
-            const char* algorithms[] = {"buildMeshlets (greedy)", "buildMeshletsFlex", "buildMeshletsSpatial (RT)", "buildMeshletsScan (fast)"};
-            int algorithm = int(settings.algorithm);
-            if (ImGui::Combo("Algorithm", &algorithm, algorithms, IM_ARRAYSIZE(algorithms)))
-            {
-                settings.algorithm = MeshletAlgorithm(algorithm);
-                changed = true;
-            }
-        }
-
-        ImGui::SliderInt("Max vertices", &settings.maxVertices, 3, maxVertexLimit());
-        changed |= ImGui::IsItemDeactivatedAfterEdit();
-        ImGui::SliderInt("Max triangles", &settings.maxTriangles, 4, maxTriangleLimit());
-        changed |= ImGui::IsItemDeactivatedAfterEdit();
-
-        const bool flex = settings.lod ? !settings.lodSpatial : settings.algorithm == MeshletAlgorithm::Flex;
-        const bool spatial = settings.lod ? settings.lodSpatial : settings.algorithm == MeshletAlgorithm::Spatial;
-        if (flex || spatial)
-        {
-            ImGui::SliderInt("Min triangles", &settings.minTriangles, 1, settings.maxTriangles);
-            changed |= ImGui::IsItemDeactivatedAfterEdit();
-        }
-        if (!settings.lod && (settings.algorithm == MeshletAlgorithm::Greedy || flex))
-        {
-            ImGui::SliderFloat("Cone weight", &settings.coneWeight, 0.f, 1.f);
-            changed |= ImGui::IsItemDeactivatedAfterEdit();
-        }
-        if (flex)
-        {
-            ImGui::SliderFloat("Split factor", &settings.splitFactor, 0.f, 4.f);
-            changed |= ImGui::IsItemDeactivatedAfterEdit();
-        }
-        if (spatial)
-        {
-            ImGui::SliderFloat("Fill weight", &settings.fillWeight, 0.f, 1.f);
-            changed |= ImGui::IsItemDeactivatedAfterEdit();
-        }
-        if (settings.lod)
-        {
-            ImGui::SliderFloat("Simplify ratio", &settings.lodSimplifyRatio, 0.1f, 0.9f, "%.2f");
-            changed |= ImGui::IsItemDeactivatedAfterEdit();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Target triangle count of each level relative to the previous one");
-            ImGui::SliderInt("Partition size", &settings.lodPartitionSize, 2, 64);
-            changed |= ImGui::IsItemDeactivatedAfterEdit();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Clusters per group that are simplified together (larger: fewer levels, slower build)");
-        }
-        changed |= ImGui::Checkbox("optimizeMeshlet", &settings.optimize);
-
-        settings.maxTriangles = std::clamp(settings.maxTriangles, 4, maxTriangleLimit());
-        settings.minTriangles = std::clamp(settings.minTriangles, 1, settings.maxTriangles);
-
-        ImGui::Checkbox("Auto rebuild", &autoRebuild);
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!model);
-        if (ImGui::Button("Build now"))
-            startBuild();
-        ImGui::EndDisabled();
-        if (changed && autoRebuild)
-            startBuild();
-
-        if (meshlets)
-        {
-            const MeshletData& m = *meshlets;
-            if (ImGui::BeginTable("meshletstats", 2, ImGuiTableFlags_SizingStretchProp))
-            {
-                auto row = [](const char* label, const char* fmt, auto... args) {
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    ImGui::TextDisabled("%s", label);
-                    ImGui::TableNextColumn();
-                    ImGui::Text(fmt, args...);
-                };
-                if (m.lod)
-                    row("Clusters", "%s in %zu levels (%s level 0)", formatCount(m.meshlets.size()).c_str(), m.levelClusters.size(),
-                        formatCount(m.levelClusters[0]).c_str());
-                else
-                    row("Meshlets", "%s", formatCount(m.meshlets.size()).c_str());
-                row("Avg vertices", "%.1f (%.0f%% of max)", m.avgVertices, m.vertexFill * 100.f);
-                row("Avg triangles", "%.1f (%.0f%% of max)", m.avgTriangles, m.triangleFill * 100.f);
-                row("Vertex refs / vertex", "%.2f", model ? double(m.vertices.size()) / double(model->vertices.size()) : 0.0);
-                row("Cone-cullable", "%.0f%% (avg spread %.0f deg)", 100.0 * double(m.coneCullableFraction), m.avgConeAngleDeg);
-                row("Build time", "%.2f s", m.buildSeconds);
-                ImGui::EndTable();
-            }
         }
     }
 
@@ -847,6 +1111,14 @@ void App::ui()
                 const bool drawn = stats.valid && level < int(kMaxLodLevels) && stats.levelClusters[level] > 0;
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
+                {
+                    // the level's color in the "Meshlet (LOD gradient)" mode
+                    const std::array<float, 3> c = lod_palette::levelColor(uint32_t(level), uint32_t(std::min(levels, int(kMaxLodLevels))));
+                    const float h = ImGui::GetTextLineHeight();
+                    ImGui::ColorButton("##levelcolor", ImVec4(c[0], c[1], c[2], 1.f), ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoBorder,
+                        ImVec2(h, h));
+                    ImGui::SameLine();
+                }
                 ImGui::Text("%d", level);
                 ImGui::TableNextColumn();
                 ImGui::Text("%s", formatCount(m.levelClusters[size_t(level)]).c_str());
@@ -922,12 +1194,28 @@ void App::ui()
         }
 
         ImGui::BeginDisabled(!renderer.supportsWireframe());
-        ImGui::Checkbox("Outlines + wireframe", &draw.wireframe);
-        if (!renderer.supportsWireframe() && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("needs VK_KHR_fragment_shader_barycentric");
+        ImGui::Checkbox("Outlines + lines", &draw.wireframe);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip(renderer.supportsWireframe() ? "Meshlet outlines, plus the triangle wireframe or a UV grid"
+                                                           : "needs VK_KHR_fragment_shader_barycentric");
         ImGui::EndDisabled();
         if (draw.wireframe && model)
         {
+            // the surface shows either the triangle wireframe or a grid over its texture coordinates;
+            // the meshlet (region) outlines are drawn with both
+            const bool textured = renderer.hasTexcoords();
+            int lines = draw.uvGrid && textured ? 1 : 0;
+            ImGui::RadioButton("Triangle wireframe", &lines, 0);
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!textured);
+            ImGui::RadioButton("UV grid", &lines, 1);
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(textured ? "Grid over the texture coordinates instead of the triangle wireframe"
+                                           : "This model has no texture coordinates");
+            if (textured)
+                draw.uvGrid = lines == 1;
+
             // widths are in model units; the slider range follows the mesh resolution (0 hides the lines)
             const float edge = std::max(model->avgEdgeLength, 1e-12f);
             ImGui::SetNextItemWidth(160);
@@ -935,9 +1223,18 @@ void App::ui()
             ImGui::SameLine();
             ImGui::TextDisabled("(%.0f%% edge)", 100.f * draw.outlineWidth / edge);
             ImGui::SetNextItemWidth(160);
-            ImGui::SliderFloat("Triangle lines", &draw.wireWidth, 0.f, edge * 2.f, "%.3g units", ImGuiSliderFlags_Logarithmic);
-            ImGui::SameLine();
-            ImGui::TextDisabled("(%.0f%% edge)", 100.f * draw.wireWidth / edge);
+            if (lines == 1)
+            {
+                ImGui::SliderFloat("Grid cells", &draw.uvGridCells, 1.f, 256.f, "%.0f per UV unit", ImGuiSliderFlags_Logarithmic);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Grid lines per unit of texture space, in u and v");
+            }
+            else
+            {
+                ImGui::SliderFloat("Triangle lines", &draw.wireWidth, 0.f, edge * 2.f, "%.3g units", ImGuiSliderFlags_Logarithmic);
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%.0f%% edge)", 100.f * draw.wireWidth / edge);
+            }
         }
 
         ImGui::BeginDisabled(!renderer.usesMeshShaders());
@@ -1097,6 +1394,8 @@ struct Options
     ColorMode colorMode = ColorMode::Meshlet;
     std::string matcap = "clay_studio"; // Blender matcap for --color shaded; "none" = plain lighting
     bool wireframe = true;
+    bool uvGrid = false;      // UV grid instead of the triangle wireframe (models with texture coordinates)
+    float uvGridCells = 16.f; // grid cells per UV unit
     float wireWidth = 0.f;    // model units; 0 = automatic
     float outlineWidth = 0.f; // model units; 0 = automatic
     bool frustumCull = true;
@@ -1128,6 +1427,11 @@ struct Options
     int frames = 0;
     std::string screenshot;
     std::string saveLod;
+
+    // LOD source for mesh files (a .mlod input always shows the file's hierarchy)
+    LodSource lodSource = LodSource::Meshoptimizer;
+    std::string meshletOptimizer; // executable override
+    MeshletOptimizerParams mopt;
 };
 
 bool parseOptions(int argc, char** argv, Options& opt)
@@ -1167,13 +1471,26 @@ bool parseOptions(int argc, char** argv, Options& opt)
     program.add_argument("--lod-partition").metavar("N").default_value(defaults.lodPartitionSize).nargs(1).scan<'i', int>().help("clusters per simplification group [2, 64]");
     program.add_argument("--lod-error").metavar("PX").default_value(1.f).nargs(1).scan<'g', float>().help("pixel error threshold for automatic LOD selection");
     program.add_argument("--lod-sweep").flag().help("step the fixed level finest -> coarsest -> back, one level per second");
+    program.add_argument("--lod-source").default_value(std::string("meshoptimizer")).nargs(1).choices("meshoptimizer", "meshlet-optimizer")
+        .help("how a mesh file's hierarchy is built: meshoptimizer (clusterlod.h) or meshlet-optimizer (external/meshlet-optimizer); a .mlod input is shown as saved");
     program.add_argument("--lod-level").metavar("N").default_value(-1).nargs(1).scan<'i', int>().help("show a fixed DAG level instead of automatic selection");
+
+    const MeshletOptimizerParams moptDefaults;
+    program.add_group("meshlet-optimizer (with --lod-source meshlet-optimizer; the sidebar has more settings)");
+    program.add_argument("--meshlet-optimizer").metavar("PATH").default_value(defaultMeshletOptimizerPath()).nargs(1).help("meshlet-optimizer executable [default: the one built with the viewer]");
+    program.add_argument("--mopt-chart-triangles").metavar("N").default_value(moptDefaults.chartTriangles).nargs(1).scan<'i', int>().help("largest base chart in triangles [16, 256]");
+    program.add_argument("--mopt-stop-at-regions").metavar("N").default_value(moptDefaults.stopAtRegions).nargs(1).scan<'i', int>().help("stop once the top level has at most N regions (>= 1)");
+    program.add_argument("--mopt-max-depth").metavar("N").default_value(moptDefaults.maxDepth).nargs(1).scan<'i', int>().help("most levels above the base (>= 1)");
+    program.add_argument("--mopt-interior-fraction").metavar("F").default_value(moptDefaults.interiorFraction).nargs(1).scan<'g', float>().help("interior vertices kept per region and level (0, 1]");
+    program.add_argument("--mopt-threads").metavar("N").default_value(moptDefaults.threads).nargs(1).scan<'i', int>().help("threads (0 = all cores)");
 
     // ---- view ----
     program.add_group("View");
     program.add_argument("-c", "--color").default_value(std::string("meshlet")).nargs(1).choices("meshlet", "triangle", "normal", "shaded").help("color mode (meshlet: colored by LOD level)");
     program.add_argument("--matcap").metavar("NAME").default_value(std::string("clay_studio")).nargs(1).help("Blender matcap from assets/matcap for --color shaded (file name without .png, or none)");
     program.add_argument("--no-wireframe").flag().help("hide the meshlet outlines and triangle wireframe");
+    program.add_argument("--uv-grid").flag().help("draw a grid over the texture coordinates instead of the triangle wireframe (meshlet outlines stay; models with texture coordinates)");
+    program.add_argument("--uv-grid-cells").metavar("N").default_value(16.f).nargs(1).scan<'g', float>().help("UV grid cells per unit of texture space [1, 256]");
     program.add_argument("--wire-width").metavar("W").default_value(0.f).nargs(1).scan<'g', float>().help("triangle wireframe line width in model units (0 = 5% of the average edge length)");
     program.add_argument("--outline-width").metavar("W").default_value(0.f).nargs(1).scan<'g', float>().help("meshlet outline width in model units (0 = 25% of the average edge length)");
     program.add_argument("--no-frustum-cull").flag().help("disable task-shader frustum culling");
@@ -1261,6 +1578,28 @@ bool parseOptions(int argc, char** argv, Options& opt)
     if (opt.lodSweep && (program.is_used("--lod-error") || program.is_used("--lod-level")))
         return fail("--lod-sweep cannot be combined with --lod-error or --lod-level");
     opt.lodLevel = std::max(opt.lodLevel, 0);
+
+    // LOD source
+    opt.lodSource = program.get<std::string>("--lod-source") == "meshlet-optimizer" ? LodSource::MeshletOptimizer : LodSource::Meshoptimizer;
+    opt.meshletOptimizer = program.get<std::string>("--meshlet-optimizer");
+    MeshletOptimizerParams& mo = opt.mopt;
+    mo.chartTriangles = program.get<int>("--mopt-chart-triangles");
+    mo.stopAtRegions = program.get<int>("--mopt-stop-at-regions");
+    mo.maxDepth = program.get<int>("--mopt-max-depth");
+    mo.interiorFraction = program.get<float>("--mopt-interior-fraction");
+    mo.threads = program.get<int>("--mopt-threads");
+    if (mo.chartTriangles < 16 || mo.chartTriangles > 256)
+        return fail("--mopt-chart-triangles must be in [16, 256]");
+    if (mo.stopAtRegions < 1 || mo.maxDepth < 1 || mo.threads < 0)
+        return fail("--mopt-stop-at-regions and --mopt-max-depth must be >= 1, --mopt-threads >= 0");
+    if (!(mo.interiorFraction > 0.f) || mo.interiorFraction > 1.f)
+        return fail("--mopt-interior-fraction must be in (0, 1]");
+    if (opt.lodSource == LodSource::MeshletOptimizer && opt.meshletOptimizer.empty())
+        return fail("--lod-source meshlet-optimizer: meshlet-optimizer was not built with this viewer (git submodule update --init --recursive, "
+                    "then rebuild) and no --meshlet-optimizer PATH was given");
+    for (const char* name : {"--mopt-chart-triangles", "--mopt-stop-at-regions", "--mopt-max-depth", "--mopt-interior-fraction", "--mopt-threads"})
+        if (program.is_used(name) && opt.lodSource != LodSource::MeshletOptimizer)
+            std::fprintf(stderr, "warning: %s has no effect without --lod-source meshlet-optimizer\n", name);
     if (m.lodSimplifyRatio < 0.1f || m.lodSimplifyRatio > 0.9f)
         return fail("--lod-ratio must be in [0.1, 0.9]");
     if (m.lodPartitionSize < 2 || m.lodPartitionSize > 64)
@@ -1314,6 +1653,14 @@ bool parseOptions(int argc, char** argv, Options& opt)
                     : color == "shaded" ? ColorMode::Shaded
                                         : ColorMode::Meshlet;
     opt.wireframe = !program.get<bool>("--no-wireframe");
+    opt.uvGrid = program.get<bool>("--uv-grid");
+    opt.uvGridCells = program.get<float>("--uv-grid-cells");
+    if (opt.uvGridCells < 1.f || opt.uvGridCells > 256.f)
+        return fail("--uv-grid-cells must be in [1, 256]");
+    if (opt.uvGrid && !opt.wireframe)
+        return fail("--uv-grid replaces the wireframe: it cannot be combined with --no-wireframe");
+    if (program.is_used("--uv-grid-cells") && !opt.uvGrid)
+        std::fprintf(stderr, "warning: --uv-grid-cells has no effect without --uv-grid\n");
     opt.wireWidth = program.get<float>("--wire-width");
     opt.outlineWidth = program.get<float>("--outline-width");
     if (opt.wireWidth < 0.f || opt.outlineWidth < 0.f)
@@ -1477,6 +1824,8 @@ int main(int argc, char** argv)
     app->optimizeVertexCache = opt.vertexCache;
     app->draw.mode = opt.colorMode;
     app->draw.wireframe = opt.wireframe;
+    app->draw.uvGrid = opt.uvGrid;
+    app->draw.uvGridCells = opt.uvGridCells;
     app->wireWidthOverride = opt.wireWidth;
     app->outlineWidthOverride = opt.outlineWidth;
     if (opt.wireframe && !app->renderer.supportsWireframe())
@@ -1503,6 +1852,10 @@ int main(int argc, char** argv)
     app->sidebarWidth = opt.sidebarWidth;
     app->autoRotate = opt.autoRotate;
     app->saveAfterBuild = opt.saveLod;
+    app->meshSource = opt.lodSource;
+    app->lodSource = opt.lodSource;
+    app->moptExe = opt.meshletOptimizer;
+    app->moptParams = opt.mopt;
     app->rotateSpeed = opt.rotateSpeed;
     app->autoZoom = opt.autoZoom;
     app->zoomPeriod = opt.zoomPeriod;
