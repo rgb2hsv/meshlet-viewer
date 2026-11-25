@@ -1436,7 +1436,7 @@ struct Options
 
 bool parseOptions(int argc, char** argv, Options& opt)
 {
-    argparse::ArgumentParser program("meshlets", "0.1.0");
+    argparse::ArgumentParser program("meshlet-viewer", "0.1.0");
     program.add_description("Splits a PLY/OBJ model into meshlets with meshoptimizer and visualizes them with Vulkan mesh shaders.");
     program.add_epilog("Examples:\n  meshlets assets/model/metasphere.ply --lod-error 2 -c lod\n  meshlets assets/model/metasphere.ply --no-lod --algorithm flex --max-vertices 128 --max-triangles 128 --min-triangles 64");
 
@@ -1772,7 +1772,7 @@ int main(int argc, char** argv)
     }
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    GLFWwindow* window = glfwCreateWindow(opt.width, opt.height, "meshlets", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(opt.width, opt.height, "meshlet-viewer", nullptr, nullptr);
     if (!window)
     {
         std::fprintf(stderr, "glfwCreateWindow failed\n");

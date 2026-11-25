@@ -2,14 +2,14 @@
 # Renders the metasphere images in docs/assets/img with the viewer, and saves the two hierarchies
 # the builder comparison measures (docs/_figures/mlod_stats.py).
 #
-#   bash docs/_figures/render_images.sh [path/to/meshlets]
+#   bash docs/_figures/render_images.sh [path/to/meshlet-viewer]
 #
 # MLOD_DIR=dir keeps the two .mlod files there (for mlod_stats.py); otherwise they are temporary.
 #
 # Needs ffmpeg (PNG -> JPEG / WebP). Run from the repository root.
 set -euo pipefail
 
-VIEWER=${1:-./build/meshlets}
+VIEWER=${1:-./build/meshlet-viewer}
 IMG=docs/assets/img
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

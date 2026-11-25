@@ -111,7 +111,7 @@ void VulkanContext::createInstance(bool validation)
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 
     VkApplicationInfo appInfo = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    appInfo.pApplicationName = "meshlets";
+    appInfo.pApplicationName = "meshlet-viewer";
     appInfo.apiVersion = VK_API_VERSION_1_3;
 
     VkInstanceCreateInfo createInfo = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};

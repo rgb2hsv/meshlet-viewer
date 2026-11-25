@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(meshlets VERSION 0.1.0 LANGUAGES C CXX)
+project(meshlet-viewer VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -106,8 +106,8 @@ compile_shader(lod_finalize.comp comp kLodFinalizeSpv)
 
 add_custom_target(shaders DEPENDS ${SHADER_HEADERS})
 
-# --- meshlets --------------------------------------------------------------
-add_executable(meshlets
+# --- meshlet-viewer ---------------------------------------------------------
+add_executable(meshlet-viewer
     src/main.cpp
     src/vk_context.cpp
     src/model.cpp
@@ -118,13 +118,13 @@ add_executable(meshlets
     src/lod_palette.cpp
     ${SHADER_HEADERS}
 )
-add_dependencies(meshlets shaders)
-target_compile_definitions(meshlets PRIVATE MESHLETS_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
-target_include_directories(meshlets PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${SHADER_OUT_DIR})
-target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/stb)   # stb_image (matcap PNGs)
-target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/eigen) # Eigen (header-only vector math)
-target_include_directories(meshlets SYSTEM PRIVATE ${EXTERNAL_DIR}/cereal/include) # cereal (header-only serialization)
-target_link_libraries(meshlets PRIVATE meshoptimizer argparse::argparse imgui::imgui glfw volk::volk Threads::Threads)
+add_dependencies(meshlet-viewer shaders)
+target_compile_definitions(meshlet-viewer PRIVATE MESHLETS_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/assets")
+target_include_directories(meshlet-viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${SHADER_OUT_DIR})
+target_include_directories(meshlet-viewer SYSTEM PRIVATE ${EXTERNAL_DIR}/stb)   # stb_image (matcap PNGs)
+target_include_directories(meshlet-viewer SYSTEM PRIVATE ${EXTERNAL_DIR}/eigen) # Eigen (header-only vector math)
+target_include_directories(meshlet-viewer SYSTEM PRIVATE ${EXTERNAL_DIR}/cereal/include) # cereal (header-only serialization)
+target_link_libraries(meshlet-viewer PRIVATE meshoptimizer argparse::argparse imgui::imgui glfw volk::volk Threads::Threads)
 
 # --- meshlet-optimizer -------------------------------------------------------
 # Built as its own project (C++20, OpenMP, its own dependencies) and run by the viewer as a child
@@ -150,17 +150,17 @@ if(EXISTS ${MESHLET_OPTIMIZER_DIR}/CMakeLists.txt)
         INSTALL_COMMAND ""
         BUILD_ALWAYS ON
         USES_TERMINAL_BUILD ON)
-    add_dependencies(meshlets meshlet_optimizer)
-    target_compile_definitions(meshlets PRIVATE MESHLET_OPTIMIZER_EXE="${MOPT_EXE}")
+    add_dependencies(meshlet-viewer meshlet_optimizer)
+    target_compile_definitions(meshlet-viewer PRIVATE MESHLET_OPTIMIZER_EXE="${MOPT_EXE}")
 else()
     message(WARNING "${MESHLET_OPTIMIZER_DIR} is missing: the meshlet-optimizer LOD source is unavailable "
                     "(run: git submodule update --init --recursive)")
 endif()
 
 if(MSVC)
-    target_compile_options(meshlets PRIVATE /W4)
+    target_compile_options(meshlet-viewer PRIVATE /W4)
     # M_PI etc. from <cmath>; silence fopen/sscanf "unsafe" deprecation warnings
-    target_compile_definitions(meshlets PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_compile_definitions(meshlet-viewer PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS NOMINMAX)
 else()
-    target_compile_options(meshlets PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
+    target_compile_options(meshlet-viewer PRIVATE -Wall -Wextra -Wpedantic -Wno-missing-field-initializers)
 endif()

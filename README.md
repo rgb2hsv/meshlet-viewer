@@ -1,4 +1,4 @@
-# meshlets
+# meshlet-viewer
 
 Interactive meshlet viewer: loads a PLY/OBJ model, builds its meshlet LOD hierarchy with
 [meshoptimizer](https://github.com/zeux/meshoptimizer) or
@@ -7,7 +7,7 @@ with Vulkan task + mesh shaders (`VK_EXT_mesh_shader`), with a vertex-shader fal
 [Building meshlets](docs/index.md) explains both builders and compares their hierarchies on the metasphere.
 The UI is a Dear ImGui sidebar on the left (on GLFW); drag its right edge to resize it.
 
-![The meshlets viewer showing metasphere.ply built by meshlet-optimizer, with meshlet outlines and the LOD source sidebar](docs/assets/img/screenshot.webp)
+![meshlet-viewer showing metasphere.ply built by meshlet-optimizer, with meshlet outlines and the LOD source sidebar](docs/assets/img/screenshot.webp)
 
 - Task shader: per-meshlet frustum and normal-cone (backface) culling
 - Mesh shader: one workgroup per meshlet, up to 256 vertices / 256 triangles
@@ -58,16 +58,16 @@ cmake --build build
 ## Run
 
 ```bash
-./build/meshlets                       # loads assets/model/metasphere.ply
-./build/meshlets path/to/model.ply     # or -i/--input PATH
-./build/meshlets --no-lod -a flex --max-vertices 128 --max-triangles 128 --min-triangles 64
-./build/meshlets -c shaded --matcap metal_carpaint --outline-width 0.3 --wire-width 0.05
-./build/meshlets --lod-error 2          # coarser cut (or --lod-level N for a fixed level)
-./build/meshlets --lod-sweep           # step through the levels and back ("Sweep levels" in the sidebar)
-./build/meshlets --save-lod model.mlod  # save the mesh + meshlet hierarchy once it is built
-./build/meshlets model.mlod            # load it back: no rebuild
-./build/meshlets --lod-source meshlet-optimizer   # build the hierarchy with meshlet-optimizer
-./build/meshlets --help                # all options
+./build/meshlet-viewer                       # loads assets/model/metasphere.ply
+./build/meshlet-viewer path/to/model.ply     # or -i/--input PATH
+./build/meshlet-viewer --no-lod -a flex --max-vertices 128 --max-triangles 128 --min-triangles 64
+./build/meshlet-viewer -c shaded --matcap metal_carpaint --outline-width 0.3 --wire-width 0.05
+./build/meshlet-viewer --lod-error 2          # coarser cut (or --lod-level N for a fixed level)
+./build/meshlet-viewer --lod-sweep           # step through the levels and back ("Sweep levels" in the sidebar)
+./build/meshlet-viewer --save-lod model.mlod  # save the mesh + meshlet hierarchy once it is built
+./build/meshlet-viewer model.mlod            # load it back: no rebuild
+./build/meshlet-viewer --lod-source meshlet-optimizer   # build the hierarchy with meshlet-optimizer
+./build/meshlet-viewer --help                # all options
 ```
 
 A `.mlod` file holds the mesh (vertices, indices), the builder settings and everything the
@@ -124,7 +124,7 @@ include `-c/--color`, `--matcap`, `--no-wireframe`, `--wire-width`, `--outline-w
 `--background R G B` and `--width/--height`:
 
 ```bash
-./build/meshlets --screenshot shot.png --screenshot-pane -c shaded --no-wireframe \
+./build/meshlet-viewer --screenshot shot.png --screenshot-pane -c shaded --no-wireframe \
     --yaw -60 --pitch 20 --background 1 1 1
 ```
 
@@ -148,6 +148,6 @@ diffuse + specular (the look of a white material), clipped to [0, 1] and stored 
 The default model is `assets/model/metasphere.ply` (66K vertices, 132K triangles). For a
 large stress test, the Stanford Lucy scan (14M vertices, 28M triangles, 533 MB) from the
 Stanford 3D Scanning Repository (http://graphics.stanford.edu/data/3Dscanrep/) works well:
-`./build/meshlets path/to/lucy.ply --z-up`. It is not in the repository; `assets/lucy.ply`
+`./build/meshlet-viewer path/to/lucy.ply --z-up`. It is not in the repository; `assets/lucy.ply`
 is git-ignored if you keep a local copy there.
 Its terms allow research use and ask for attribution.
