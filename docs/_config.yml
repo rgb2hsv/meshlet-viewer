@@ -1,13 +1,19 @@
-title: Meshlets
-description: How the meshlets viewer turns a triangle mesh into GPU-ready clusters and a cluster LOD hierarchy.
-baseurl: /meshlets
-repository: rgb2hsv/meshlets
+# GitHub Pages: served from main:/docs at https://rgb2hsv.github.io/meshlet-viewer/
+title: Meshlet Viewer
+description: How the meshlet viewer turns a triangle mesh into meshlets and a cluster LOD hierarchy with meshoptimizer or meshlet-optimizer, and how the two hierarchies compare.
+url: https://rgb2hsv.github.io
+baseurl: /meshlet-viewer
+repository: rgb2hsv/meshlet-viewer
+lang: en
 
 markdown: kramdown
 kramdown:
   input: GFM
   math_engine: mathjax
   syntax_highlighter: rouge
+  auto_ids: true
 
 exclude:
   - _figures
+  - Gemfile
+  - Gemfile.lock
