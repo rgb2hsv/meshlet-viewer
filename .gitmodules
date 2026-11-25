@@ -31,3 +31,6 @@
 [submodule "external/cereal"]
 	path = external/cereal
 	url = https://github.com/USCiLab/cereal.git
+[submodule "external/meshlet-optimizer"]
+	path = external/meshlet-optimizer
+	url = git@github.com:rgb2hsv/meshlet-optimizer.git
