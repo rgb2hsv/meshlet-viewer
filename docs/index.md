@@ -366,6 +366,15 @@ clusters, it partitions the surface into **regions**, merges them level by level
 </figure>
 
 <figure>
+  <video src="assets/video/mopt-auto-lod.mp4" poster="assets/video/mopt-auto-lod.jpg" width="1280" height="824"
+         autoplay muted loop playsinline controls preload="metadata"
+         aria-label="The viewer orbiting and zooming around a meshlet-optimizer metasphere with automatic LOD selection"></video>
+  <figcaption>A meshlet-optimizer <code>.mlod</code> of the metasphere in the viewer, with automatic selection at about a 5 px error threshold,
+  <code>--auto-rotate</code> and <code>--auto-zoom</code>. As the camera closes in, finer levels (lighter) replace coarser ones (darker), and
+  meshlets of different levels meet along shared borders without cracks. The sidebar's level table shows how many triangles each level draws.</figcaption>
+</figure>
+
+<figure>
   <div class="grid grid-2">
     <figure><img src="assets/img/mopt-uv0.jpg" alt="UV grid over meshlet-optimizer's level 0 atlas"><figcaption>L0 atlas</figcaption></figure>
     <figure><img src="assets/img/mopt-uv4.jpg" alt="UV grid over meshlet-optimizer's level 4 atlas"><figcaption>L4 atlas</figcaption></figure>
