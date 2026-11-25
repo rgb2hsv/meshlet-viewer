@@ -16,7 +16,10 @@ namespace
 {
 
 constexpr uint32_t kMagic = 0x444f4c4d; // "MLOD" in little endian
+// Version 1: no texture coordinates. Version 2: one texture coordinate per vertex, right after the vertices
+// (meshlet-optimizer writes them for textured models; vertices on texture seams are split).
 constexpr uint32_t kVersion = 1;
+constexpr uint32_t kTexcoordVersion = 2;
 
 using OutputArchive = cereal::PortableBinaryOutputArchive;
 using InputArchive = cereal::PortableBinaryInputArchive;
@@ -24,7 +27,7 @@ using InputArchive = cereal::PortableBinaryInputArchive;
 // The GPU structs are written as raw arrays of 32-bit words (one bulk write per array instead of one
 // call per field); portable binary byte-swaps each word when the reader's endianness differs.
 // This needs every field to be a 4-byte scalar, which these layouts are (std430, no padding gaps).
-static_assert(sizeof(Vertex) == 24 && sizeof(meshopt_Meshlet) == 16 && sizeof(MeshletBounds) == 32 && sizeof(MeshletLod) == 48 &&
+static_assert(sizeof(Vertex) == 24 && sizeof(Texcoord) == 8 && sizeof(meshopt_Meshlet) == 16 && sizeof(MeshletBounds) == 32 && sizeof(MeshletLod) == 48 &&
                   sizeof(LodNode) == 32 && sizeof(LodGroupRange) == 8,
     "meshlet file layout: update kVersion and the serialization when these structs change");
 
@@ -74,7 +77,7 @@ void sizeArray(InputArchive& ar, std::vector<size_t>& v, uint64_t maxBytes)
 
 // One function for both directions (cereal style); maxBytes bounds array sizes when loading.
 template <class Archive>
-void archive(Archive& ar, Model& m, MeshletSettings& s, MeshletData& d, uint64_t maxBytes)
+void archive(Archive& ar, uint32_t version, Model& m, MeshletSettings& s, MeshletData& d, uint64_t maxBytes)
 {
     int32_t algorithm = int32_t(s.algorithm);
     ar(algorithm, s.maxVertices, s.maxTriangles, s.minTriangles, s.coneWeight, s.splitFactor, s.fillWeight, s.optimize);
@@ -82,6 +85,8 @@ void archive(Archive& ar, Model& m, MeshletSettings& s, MeshletData& d, uint64_t
     s.algorithm = MeshletAlgorithm(algorithm);
 
     array<uint32_t>(ar, m.vertices, maxBytes);
+    if (version >= kTexcoordVersion)
+        array<uint32_t>(ar, m.texcoords, maxBytes);
     array<uint32_t>(ar, m.indices, maxBytes);
     ar(m.boundsMin, m.boundsMax, m.center, m.radius, m.avgEdgeLength);
 
@@ -115,6 +120,8 @@ bool validate(const Model& m, const MeshletData& d, std::string& error)
     const size_t vertexCount = m.vertices.size();
     if (m.indices.size() % 3 != 0 || std::any_of(m.indices.begin(), m.indices.end(), [&](uint32_t i) { return i >= vertexCount; }))
         error = "bad index buffer";
+    else if (!m.texcoords.empty() && m.texcoords.size() != vertexCount)
+        error = "texture coordinates do not match the vertices";
     else if (d.meshlets.empty() || d.levelClusters.empty())
         error = "no meshlets";
     else if (d.bounds.size() != d.meshlets.size() || d.lods.size() != d.meshlets.size())
@@ -157,10 +164,10 @@ bool saveMeshletFile(const std::string& path, const Model& model, const MeshletS
                 return false;
             }
             OutputArchive ar(out);
-            uint32_t magic = kMagic, version = kVersion;
+            uint32_t magic = kMagic, version = model.texcoords.empty() ? kVersion : kTexcoordVersion;
             ar(magic, version);
             // the archive only reads through these references
-            archive(ar, const_cast<Model&>(model), const_cast<MeshletSettings&>(settings), const_cast<MeshletData&>(data), 0);
+            archive(ar, version, const_cast<Model&>(model), const_cast<MeshletSettings&>(settings), const_cast<MeshletData&>(data), 0);
             out.flush();
             if (!out)
             {
@@ -205,12 +212,13 @@ bool loadMeshletFile(const std::string& path, Model& model, MeshletSettings& set
             error = path + " is not a meshlet LOD file";
             return false;
         }
-        if (version != kVersion)
+        if (version != kVersion && version != kTexcoordVersion)
         {
-            error = path + ": unsupported meshlet file version " + std::to_string(version) + " (expected " + std::to_string(kVersion) + ")";
+            error = path + ": unsupported meshlet file version " + std::to_string(version) + " (expected " + std::to_string(kVersion) +
+                " or " + std::to_string(kTexcoordVersion) + ")";
             return false;
         }
-        archive(ar, model, settings, data, fileBytes);
+        archive(ar, version, model, settings, data, fileBytes);
     }
     catch (const std::exception& e)
     {

@@ -12,10 +12,16 @@ struct Vertex
     float nx, ny, nz;
 };
 
+struct Texcoord
+{
+    float u, v;
+};
+
 struct Model
 {
     std::string path;
     std::vector<Vertex> vertices;
+    std::vector<Texcoord> texcoords; // one per vertex, from .mlod version 2 files; empty otherwise
     std::vector<uint32_t> indices;
     float boundsMin[3] = {0, 0, 0};
     float boundsMax[3] = {0, 0, 0};
