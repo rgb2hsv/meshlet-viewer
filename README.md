@@ -1,11 +1,13 @@
 # meshlets
 
-Interactive meshlet viewer: loads a PLY/OBJ model, splits it into meshlets with
-[meshoptimizer](https://github.com/zeux/meshoptimizer), and renders them with Vulkan task + mesh
-shaders (`VK_EXT_mesh_shader`), with a vertex-shader fallback for GPUs without them.
+Interactive meshlet viewer: loads a PLY/OBJ model, builds its meshlet LOD hierarchy with
+[meshoptimizer](https://github.com/zeux/meshoptimizer) or
+[meshlet-optimizer](https://github.com/rgb2hsv/meshlet-optimizer) (or loads a saved one), and renders it
+with Vulkan task + mesh shaders (`VK_EXT_mesh_shader`), with a vertex-shader fallback for GPUs without them.
+[Building meshlets](docs/index.md) explains both builders and compares their hierarchies on the metasphere.
 The UI is a Dear ImGui sidebar on the left (on GLFW); drag its right edge to resize it.
 
-![The meshlets viewer showing metasphere.ply as a cluster LOD cut, with meshlet outlines and the LOD sidebar](docs/assets/img/screenshot.webp)
+![The meshlets viewer showing metasphere.ply built by meshlet-optimizer, with meshlet outlines and the LOD source sidebar](docs/assets/img/screenshot.webp)
 
 - Task shader: per-meshlet frustum and normal-cone (backface) culling
 - Mesh shader: one workgroup per meshlet, up to 256 vertices / 256 triangles
@@ -25,10 +27,14 @@ The UI is a Dear ImGui sidebar on the left (on GLFW); drag its right edge to res
   simplified clusters. The task shader picks a crack-free cut per frame from a pixel error
   threshold, or shows a fixed level. Automatic selection walks a BVH over the cluster groups
   (`clodBuildHierarchy`) in compute passes, one per tree depth, so only candidate clusters reach
-  the task shader (Lucy: identical cut, 3.0 -> 1.2 ms). You can freeze the LOD + culling camera
-  to inspect the cut from elsewhere and see per-level cluster/triangle stats. Lucy: 19 levels,
-  45 s single-threaded build; the full view draws ~85K of 28M triangles at 1 px
-- Loading and meshlet building run on a background thread (Lucy, 28M triangles: about 5s + 12s)
+  the task shader. You can freeze the LOD + culling camera to inspect the cut from elsewhere and
+  see per-level cluster/triangle stats
+- meshlet-optimizer hierarchies (`--lod-source meshlet-optimizer`): CVT charts of the input,
+  merged level by level into nested regions that are flattened and remeshed, with per-level UV
+  atlases. On the metasphere its level 0 meshlets are rounder and fuller, while meshoptimizer's DAG
+  stays closer to the input surface for a given triangle count (see the
+  [comparison](docs/index.md#comparing-the-two-hierarchies))
+- Loading and meshlet building run on a background thread
 - Save the mesh and its meshlet hierarchy as one `.mlod` file ([cereal](https://github.com/USCiLab/cereal)
   portable binary) and load it later in place of the model to skip loading and building
 
@@ -79,12 +85,13 @@ The sidebar's first section, **LOD source**, picks where the hierarchy comes fro
 its own input file and settings:
 
 - **meshoptimizer (mesh file)**: a `.ply`/`.obj` built with meshoptimizer's `clusterlod.h` (or one
-  meshlet level with "Build LOD hierarchy" off). Builds take seconds and rerun as settings change.
+  meshlet level with "Build LOD hierarchy" off). Builds rerun as settings change.
 - **meshlet-optimizer (mesh file)**: a `.ply`/`.obj` built by meshlet-optimizer
   (`external/meshlet-optimizer`): CVT charts, then levels of clustered, flattened and remeshed
   regions. CMake builds the tool alongside the viewer (`ExternalProject`, always Release); the
   viewer writes the mesh to a temporary PLY, runs the tool as a child process and loads the `.mlod`
-  it writes. A build takes about half a minute on the metasphere, so settings apply with the Build
+  it writes. Its build does asymptotically more work than meshoptimizer's (iterative CVT, global
+  LSCM solves; see [complexity](docs/index.md#meshlet-optimizer-a-remeshed-hierarchy)), so settings apply with the Build
   button. Command line: `--lod-source meshlet-optimizer`, `--mopt-chart-triangles`,
   `--mopt-stop-at-regions`, `--mopt-max-depth`, `--mopt-interior-fraction`, `--mopt-threads`, and
   `--meshlet-optimizer PATH` to run another build of the tool.

@@ -1,13 +1,15 @@
 ---
 layout: default
 title: Building meshlets
-description: The pipeline that turns a triangle mesh into meshlets and a cluster LOD DAG, with a close look at how the clustering works.
+description: How the viewer turns a triangle mesh into meshlets and a cluster LOD DAG, with meshoptimizer or meshlet-optimizer, and how the two hierarchies compare.
 ---
 
 # Building meshlets
 
 <p class="lede">How the viewer turns a triangle mesh into small, GPU-sized clusters of triangles (meshlets),
-then into a hierarchy of progressively simplified clusters that the GPU can pick from every frame.</p>
+then into a hierarchy of progressively coarser clusters that the GPU can pick from every frame. Two builders make
+that hierarchy: meshoptimizer simplifies groups of clusters, meshlet-optimizer remeshes nested surface regions.
+The last sections compare what they produce on the bundled metasphere.</p>
 
 <figure>
   <div class="grid grid-4">
@@ -16,9 +18,10 @@ then into a hierarchy of progressively simplified clusters that the GPU can pick
     <figure><img src="assets/img/lod4.jpg" alt="Metasphere at DAG level 4"><figcaption>L4 · 8.3K</figcaption></figure>
     <figure><img src="assets/img/lod6.jpg" alt="Metasphere at DAG level 6"><figcaption>L6 · 2.1K</figcaption></figure>
   </div>
-  <figcaption>The bundled <code>metasphere.ply</code> at four levels of the cluster DAG (<code>--lod-level N</code>). Black lines are meshlet
-  borders, thin lines are triangles, and the color encodes the level (blue = full detail, orange = coarsest). Every level is built from the same
-  clustering steps described below.</figcaption>
+  <figcaption>The bundled <code>metasphere.ply</code> at four levels of meshoptimizer's cluster DAG (<code>--lod-level N</code>). Black lines are
+  meshlet borders, thin lines are triangles, and the color encodes the level: a CIELAB palette whose lightness falls in equal steps from
+  pale yellow (full detail) to red (coarsest), with the hue turning in between, so every level stays light enough for the black lines to
+  read on it. Every level is built from the same clustering steps described below.</figcaption>
 </figure>
 
 <div class="toc" markdown="1">
@@ -30,8 +33,10 @@ then into a hierarchy of progressively simplified clusters that the GPU can pick
 4. [Clustering one level](#clustering-one-level)
 5. [Per-meshlet data](#per-meshlet-data)
 6. [Cluster LOD: building the DAG](#cluster-lod-building-the-dag)
-7. [Picking a cut at runtime](#picking-a-cut-at-runtime)
-8. [Parameters](#parameters)
+7. [meshlet-optimizer: a remeshed hierarchy](#meshlet-optimizer-a-remeshed-hierarchy)
+8. [Picking a cut at runtime](#picking-a-cut-at-runtime)
+9. [Comparing the two hierarchies](#comparing-the-two-hierarchies)
+10. [Parameters](#parameters)
 </div>
 
 ## What a meshlet is
@@ -67,7 +72,8 @@ therefore wants:
   <img src="assets/fig/pipeline.svg" alt="Pipeline: load, weld, vertex cache order, clusterize; then a loop of partition, lock borders, simplify, re-clusterize; then per-meshlet data and the group BVH; then GPU traversal, task, mesh and fragment shaders">
   <figcaption>The build runs once per model on a background thread (<code>loadModel</code> and <code>buildMeshlets</code> in
   <code>src/model.cpp</code>). The green loop is meshoptimizer's <code>clodBuild</code> (<code>external/meshoptimizer/demo/clusterlod.h</code>);
-  with <code>--no-lod</code> it is skipped and a single level is built with one of the four builders.</figcaption>
+  with <code>--no-lod</code> it is skipped and a single level is built with one of the four builders. The other LOD source,
+  meshlet-optimizer, replaces the whole build (see <a href="#meshlet-optimizer-a-remeshed-hierarchy">below</a>).</figcaption>
 </figure>
 
 ## Preparing the mesh
@@ -312,8 +318,73 @@ Each group is reported to the viewer through a callback. For every cluster the v
   cut: they cover the surface exactly once, mixing L0, L1 and L2.</figcaption>
 </figure>
 
-On the metasphere (132K triangles) this takes 0.28 s and produces 12 levels and 2933 clusters in total: 1364 at level 0, with the triangle
-count halving at every level (132K, 66K, 33K, … 128, 64). The Lucy statue (28M triangles) reaches 19 levels in about 45 s single-threaded.
+On the metasphere (132K triangles) this produces 12 levels and 2933 clusters in total: 1364 at level 0, with the triangle
+count halving at every level (132K, 66K, 33K, … 128, 64).
+
+**Complexity.** One level does a partition, a simplification and a clusterization over its \(n\) triangles: about
+\(O(n \log n)\) (heaps in the partitioner and simplifier, near-linear clustering). Every level halves the triangle count, so the
+levels form a geometric series and the whole DAG costs \(O(T \log T)\) for \(T\) input triangles, dominated by the first level.
+There are about \(\log_2(T / T_{\max})\) levels.
+
+## meshlet-optimizer: a remeshed hierarchy
+
+`--lod-source meshlet-optimizer` (or the sidebar's LOD source) builds the hierarchy with
+[meshlet-optimizer](https://github.com/rgb2hsv/meshlet-optimizer), a submodule in `external/meshlet-optimizer`. The viewer writes the
+mesh to a temporary PLY, runs the tool and loads the `.mlod` it writes (`src/meshlet_optimizer.cpp`). Instead of simplifying groups of
+clusters, it partitions the surface into **regions**, merges them level by level, and **remeshes** every merged region from scratch:
+
+1. **Base charts.** Blue-noise seeds on the surface are relaxed to a restricted centroidal Voronoi tessellation (CVT): Lloyd iterations,
+   then L-BFGS on the CVT energy. The cells are regularized into compact, disk-shaped charts of at most `--chart-triangles` (256) triangles
+   and their borders straightened along mesh edges. These charts are level 0: the input mesh, cut into regions.
+2. **Clustering.** Each level merges the regions of the one below into cliques of up to `--max-clique` (4) neighbors, keeping each new
+   region a disk (holes filled, stray members shed).
+3. **Remeshing.** All merged regions are flattened together (planar start, then one LSCM solve, each region padded with a ring of its
+   neighbors). In 2D, each region keeps `--interior-fraction` (35%) of its interior vertices as fresh blue-noise samples, relaxed by a
+   restricted CVT and triangulated with constrained Delaunay inside the fixed border. The new points are lifted back to 3D and snapped
+   onto the input surface. Regions over 256 triangles are split in two.
+4. **Nested borders.** Each level's region borders are coarsened by edge collapses, and the finer levels' border vertices are moved onto the
+   new, coarser border edges. Every border of every level therefore lies on the borders of all levels below it, so any two levels can sit side
+   by side without a crack. A final pass fixes flat triangles that snapping creates and slides border vertices to even out border edges
+   (L-BFGS-B on a CVT energy along the borders).
+5. **UVs.** Input texture coordinates are carried through every level (regions never cross a UV seam). The metasphere has none, so the tool
+   generates one atlas per level: the level's regions are flattened and bin-packed into the unit square at one common scale.
+6. **Export.** Every region of every level becomes one meshlet. A *group* is the set of level-\(k\) regions that merge into one level-\(k+1\)
+   region, and that region is its replacement. A region's error is the larger of its children's errors and the two-way vertex distance
+   between its remeshed surface and its children's, so errors grow monotonically up the DAG, as the runtime needs. The selection BVH is
+   `clodBuildHierarchy`'s, as for meshoptimizer.
+
+<figure>
+  <div class="grid grid-4">
+    <figure><img src="assets/img/mopt-lod0.jpg" alt="meshlet-optimizer level 0 of the metasphere"><figcaption>L0 · 132K triangles</figcaption></figure>
+    <figure><img src="assets/img/mopt-lod2.jpg" alt="meshlet-optimizer level 2"><figcaption>L2 · 19.7K</figcaption></figure>
+    <figure><img src="assets/img/mopt-lod4.jpg" alt="meshlet-optimizer level 4"><figcaption>L4 · 4.7K</figcaption></figure>
+    <figure><img src="assets/img/mopt-lod6.jpg" alt="meshlet-optimizer level 6"><figcaption>L6 · 1.7K</figcaption></figure>
+  </div>
+  <figcaption>The same levels as the figure at the top, built by meshlet-optimizer. Level 0 is the input triangles, cut into CVT charts:
+  round regions of similar size. From level 1 on the triangles are new: evenly spaced inside each region, with region borders that
+  stay on the borders of every finer level. Colors use the same palette; the levels shrink faster than meshoptimizer's (10 levels instead of 12).</figcaption>
+</figure>
+
+<figure>
+  <div class="grid grid-2">
+    <figure><img src="assets/img/mopt-uv0.jpg" alt="UV grid over meshlet-optimizer's level 0 atlas"><figcaption>L0 atlas</figcaption></figure>
+    <figure><img src="assets/img/mopt-uv4.jpg" alt="UV grid over meshlet-optimizer's level 4 atlas"><figcaption>L4 atlas</figcaption></figure>
+  </div>
+  <figcaption>The generated per-level UV atlases, shown with the viewer's UV grid (<code>--uv-grid</code>) instead of the triangle wireframe.
+  Each region is one chart: grid lines run straight and evenly spaced across it (low distortion) and break at region borders, where the charts
+  are cut apart. All charts of a level share one scale, so cells are the same size everywhere.</figcaption>
+</figure>
+
+On the metasphere this produces 10 levels and 2372 meshlets: 1140 at level 0, then 735, 257, 105, … 4. Level 1 keeps 36% of the
+triangles and later levels 40–55%, so the hierarchy is shallower than meshoptimizer's.
+
+**Complexity.** The base CVT runs a fixed number of Lloyd and L-BFGS iterations, each assigning all \(T\) triangles to their nearest seeds
+through a spatial tree: \(O(I \cdot T \log T)\). Each level then works on its own \(n\) vertices: one sparse LSCM solve over all regions
+(a sparse factorization, roughly \(O(n^{1.5})\) for surface meshes), blue-noise sampling and per-region 2D CVT (\(O(n)\) per iteration),
+constrained Delaunay (\(O(n \log n)\)) and projection onto the input (\(O(n \log T)\)). Levels shrink geometrically, so they add a constant
+factor over level 1. The border relaxation optimizes the border vertices of all levels jointly, \(O(I_b \cdot B)\) for \(B\) border vertices
+over \(I_b\) iterations. The optional crack check (`--check-cracks`) compares every pair of levels, quadratic in the level count. Overall the
+tool does asymptotically more work than `clodBuild`, chiefly the iterative CVT and the global LSCM solves.
 
 ## Picking a cut at runtime
 
@@ -340,13 +411,86 @@ On the GPU, `lod_traverse.comp` walks these trees breadth-first, one compute dis
 - A leaf (one group) emits the group's clusters whose own `self` error is ≤ \\(\tau\\) as **candidates**.
 
 The task shader (`meshlet.task`) then does frustum and normal-cone culling on each candidate and launches one mesh-shader workgroup per survivor.
-On Lucy, this cuts LOD selection from 3.0 ms to 1.2 ms for an identical cut.
+Selection thus visits only the nodes along the cut, \(O(\text{cut} \cdot \log C)\), instead of testing all \(C\) clusters. Both builders'
+hierarchies are drawn this way.
 
 <figure>
-  <img src="assets/img/lod-auto.jpg" alt="The metasphere rendered with automatic LOD at a 4 pixel threshold, mixing cluster levels">
-  <figcaption>Automatic selection with <code>--lod-error 4</code>: 15K triangles in 183 clusters, out of 132K at full detail. Regions that are flatter or farther
-  away use coarser clusters, and borders between levels have no cracks because they follow locked group borders.</figcaption>
+  <div class="grid grid-2">
+    <figure><img src="assets/img/lod-auto.jpg" alt="meshoptimizer's hierarchy with automatic LOD at a 4 pixel threshold"><figcaption>meshoptimizer · 17.6K triangles, 210 meshlets</figcaption></figure>
+    <figure><img src="assets/img/mopt-lod-auto.jpg" alt="meshlet-optimizer's hierarchy with automatic LOD at a 4 pixel threshold"><figcaption>meshlet-optimizer · 27.7K, 339</figcaption></figure>
+  </div>
+  <figcaption>Automatic selection with <code>--lod-error 4</code> from a closer view, same camera for both. Regions that are flatter or farther away use
+  coarser clusters. At the same threshold meshlet-optimizer needs 58% more triangles (counts are after culling), since each of its levels
+  deviates more from the input. Borders between levels have no cracks: meshoptimizer's follow locked group borders, meshlet-optimizer's
+  follow its nested region borders.</figcaption>
 </figure>
+
+## Comparing the two hierarchies
+
+Both builders ran on the metasphere with default settings, and `docs/_figures/mlod_stats.py` measured the `.mlod` files they wrote. Each
+row is one DAG level as `--lod-level k` draws it. The builders' limits differ: meshoptimizer caps meshlets at 64 vertices and 124 triangles,
+meshlet-optimizer at 256 of each (its largest meshlet has 109 vertices and 166 triangles), so per-meshlet sizes are not like for like.
+
+Columns: **vrefs/tri** is vertex references per triangle (each meshlet transforms its vertices once, so lower is less vertex work);
+**q** is the triangle radius ratio (1 equilateral, 0 degenerate) and **slivers** the share with \(q < 0.3\); **IQ** is the median
+isoperimetric quotient \(4\pi A / P^2\) of the meshlets (1 for a disk); **cullable** is the share of meshlets whose normal cone allows
+backface culling; **deviation** is the two-way vertex-sampled distance between the level and the input surface, in input edge lengths
+(the metasphere's average edge is 0.88 units).
+
+**meshoptimizer (clodBuild)**
+
+| level | meshlets | triangles | tris / meshlet | verts / meshlet | vrefs/tri | q (median) | slivers | IQ | cullable | deviation mean | deviation max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1364 | 132524 | 97.2 | 63.7 | 0.655 | 0.979 | 0% | 0.654 | 100% | – | – |
+| 1 | 774 | 66206 | 85.5 | 60 | 0.702 | 0.838 | 1.57% | 0.504 | 99.9% | 0.00357 | 0.0927 |
+| 2 | 396 | 33068 | 83.5 | 59.9 | 0.717 | 0.749 | 3.11% | 0.442 | 99.2% | 0.0103 | 0.144 |
+| 3 | 199 | 16520 | 83 | 59.6 | 0.718 | 0.727 | 4.11% | 0.422 | 98% | 0.0223 | 0.314 |
+| 4 | 101 | 8252 | 81.7 | 58.8 | 0.72 | 0.725 | 4.64% | 0.397 | 96% | 0.0507 | 0.624 |
+| 5 | 50 | 4120 | 82.4 | 58.9 | 0.714 | 0.713 | 4.76% | 0.427 | 94% | 0.13 | 1.09 |
+| 6 | 25 | 2058 | 82.3 | 58.3 | 0.708 | 0.711 | 4.96% | 0.448 | 48% | 0.326 | 2.29 |
+| 7 | 12 | 1026 | 85.5 | 58.4 | 0.683 | 0.729 | 3.22% | 0.547 | 16.7% | 0.727 | 4.22 |
+| 8 | 6 | 512 | 85.3 | 56.3 | 0.66 | 0.717 | 2.54% | 0.527 | 16.7% | 1.5 | 8.46 |
+| 9 | 3 | 256 | 85.3 | 52.3 | 0.613 | 0.723 | 4.69% | 0.82 | 0% | 2.97 | 13 |
+| 10 | 2 | 128 | 64 | 35.5 | 0.555 | 0.607 | 10.2% | – | 50% | 4.53 | 19.9 |
+| 11 | 1 | 64 | 64 | 34 | 0.531 | 0.613 | 3.12% | – | 0% | 6.05 | 20.5 |
+
+**meshlet-optimizer**
+
+| level | meshlets | triangles | tris / meshlet | verts / meshlet | vrefs/tri | q (median) | slivers | IQ | cullable | deviation mean | deviation max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1140 | 132526 | 116 | 73.8 | 0.635 | 0.959 | 0.218% | 0.783 | 100% | – | – |
+| 1 | 735 | 48290 | 65.7 | 45.7 | 0.696 | 0.837 | 3.56% | 0.565 | 99.3% | 0.0229 | 0.762 |
+| 2 | 257 | 19682 | 76.6 | 53.2 | 0.695 | 0.763 | 6.12% | 0.475 | 93.8% | 0.0423 | 0.787 |
+| 3 | 105 | 8934 | 85.1 | 63.3 | 0.743 | 0.727 | 7.03% | 0.366 | 86.7% | 0.0773 | 1.23 |
+| 4 | 59 | 4710 | 79.8 | 65.5 | 0.821 | 0.687 | 8.47% | 0.347 | 69.5% | 0.165 | 3.84 |
+| 5 | 33 | 2692 | 81.6 | 69.3 | 0.85 | 0.659 | 10.2% | 0.342 | 54.5% | 0.382 | 4.2 |
+| 6 | 19 | 1690 | 88.9 | 78.5 | 0.883 | 0.631 | 12.5% | 0.273 | 10.5% | 0.781 | 7.99 |
+| 7 | 12 | 1074 | 89.5 | 80.2 | 0.897 | 0.627 | 12.8% | 0.304 | 0% | 1.63 | 15.3 |
+| 8 | 8 | 628 | 78.5 | 69.1 | 0.881 | 0.642 | 12.4% | 0.279 | 0% | 2.42 | 16.1 |
+| 9 | 4 | 276 | 69 | 53 | 0.768 | 0.698 | 6.88% | 0.495 | 0% | 3.18 | 15.3 |
+
+What the numbers show:
+
+- **Level 0.** Both levels are the input triangles, so they differ only in how they are cut. meshlet-optimizer's CVT charts are rounder
+  (median IQ 0.78 against 0.65) and larger, with slightly fewer vertex references per triangle (0.635 against 0.655).
+- **Accuracy per triangle.** At matching triangle counts, meshoptimizer's levels stay closer to the input. Its error-driven simplification
+  keeps vertices where curvature needs them; meshlet-optimizer resamples each region at an even density regardless of curvature. Around
+  9K triangles the mean deviation is 0.05 edges (meshoptimizer L4, 8.3K) against 0.08 (meshlet-optimizer L3, 8.9K); around 1K it is 0.73 against 1.6.
+  meshlet-optimizer also has larger worst cases from its first level on (0.8 edges at L1 against 0.09), where region borders and snapping
+  meet curved surface.
+- **Triangle shape.** meshlet-optimizer's remeshed interiors are isotropic, but its median \(q\) is about the same as meshoptimizer's at the
+  same level (0.76 against 0.75 at L2), and it has more slivers at every level past 0 (6% against 3% at L2, 12% against 5% at L6). They come
+  most likely from the region borders, which are coarsened by collapses and then constrain the triangulation on both sides.
+- **Meshlet shape and culling.** meshlet-optimizer's meshlets are whole regions, merged four at a time: compact at first, but less round
+  than meshoptimizer's re-clustered meshlets from L3 on (IQ 0.37 against 0.42), with more vertex references per triangle (0.82 against 0.72
+  at L4) and wider normal cones (cullable 70% against 96% at L4).
+- **Structure.** meshlet-optimizer's levels are strictly nested: every coarse region is the union of its children and its border is made of
+  their borders, which also gives each level a low-distortion UV atlas. meshoptimizer's groups are re-partitioned at every level, so
+  borders move, and it produces no parameterization.
+
+In short: for drawing the surface with the fewest triangles at a given error, meshoptimizer's DAG is the better hierarchy on this model.
+meshlet-optimizer trades some accuracy and culling for a nested region structure with per-level UV charts and evenly sized, round level-0
+meshlets.
 
 ## Parameters
 
@@ -365,6 +509,12 @@ On Lucy, this cuts LOD selection from 3.0 ms to 1.2 ms for an identical cut.
 | `--lod-partition N` | 16 | target clusters per group |
 | `--lod-error PX` | 1 | runtime projected-error threshold |
 | `--lod-level N` | auto | draw a fixed DAG level instead |
+| `--lod-source S` | meshoptimizer | `meshoptimizer` or `meshlet-optimizer`; a `.mlod` input is drawn as saved |
+| `--mopt-chart-triangles N` | 256 | meshlet-optimizer: largest base chart (level-0 meshlet), in triangles |
+| `--mopt-stop-at-regions N` | 2 | meshlet-optimizer: stop once the top level has at most N regions |
+| `--mopt-max-depth N` | 12 | meshlet-optimizer: most levels above the base |
+| `--mopt-interior-fraction F` | 0.35 | meshlet-optimizer: interior vertices kept per region and level |
+| `--uv-grid`, `--uv-grid-cells N` | off, 16 | draw a UV grid instead of the triangle wireframe (models with UVs) |
 
 ### Reproducing the figures
 
@@ -374,14 +524,19 @@ The diagrams in this page are generated by
 python docs/_figures/gen_figures.py
 ```
 
-and the renders by the viewer itself, e.g.
+the renders by the viewer itself (which also saves both hierarchies when `MLOD_DIR` is set), and the comparison tables by
+the statistics script:
 
 ```bash
-./build/meshlets --no-ui --width 900 --height 900 --background 1 1 1 --lod-level 2 --screenshot lod2.png
+MLOD_DIR=out bash docs/_figures/render_images.sh
+python docs/_figures/mlod_stats.py out/meshoptimizer.mlod out/meshlet-optimizer.mlod
 ```
 
 ### Further reading
 
 - Arseny Kapoulkine, [meshoptimizer](https://github.com/zeux/meshoptimizer): `src/clusterizer.cpp`, `src/partition.cpp`, `demo/clusterlod.h`.
+- [meshlet-optimizer](https://github.com/rgb2hsv/meshlet-optimizer): `src/hierarchy/MeshletBuilder.hpp` lists every stage of its build.
+- Qiang Du, Max Gunzburger, Lili Ju, *Constrained Centroidal Voronoi Tessellations for Surfaces*, SIAM J. Sci. Comput., 2003.
+- Bruno Lévy, Sylvain Petitjean, Nicolas Ray, Jérôme Maillot, *Least Squares Conformal Maps for Automatic Texture Atlas Generation*, SIGGRAPH 2002.
 - Brian Karis, Rune Stubbe, Graham Wihlidal, *Nanite: A Deep Dive*, SIGGRAPH 2021 Advances in Real-Time Rendering.
 - Takio Kurita, *An efficient agglomerative clustering algorithm using a heap*, Pattern Recognition, 1991.

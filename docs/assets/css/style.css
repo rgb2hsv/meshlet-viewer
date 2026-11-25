@@ -53,6 +53,7 @@ figure img { display: block; max-width: 100%; height: auto; margin: 0 auto; bord
 figcaption { font-size: 0.88em; color: var(--muted); margin-top: 8px; line-height: 1.5; }
 
 .grid { display: grid; gap: 10px; }
+.grid-2 { grid-template-columns: repeat(2, 1fr); }
 .grid-3 { grid-template-columns: repeat(3, 1fr); }
 .grid-4 { grid-template-columns: repeat(4, 1fr); }
 .grid figure { margin: 0; }
