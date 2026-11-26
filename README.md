@@ -11,11 +11,6 @@ The UI is a Dear ImGui sidebar on the left (on GLFW); drag its right edge to res
 
 - Task shader: per-meshlet frustum and normal-cone (backface) culling
 - Mesh shader: one workgroup per meshlet, up to 256 vertices / 256 triangles
-- Meshlets colored by LOD level with a CIELAB palette: lightness falls in even L* steps from full detail (pale yellow) to coarsest (red), with the hue turning between, so levels stay distinct and bright behind the black wireframe; the Level of detail table shows each color, or by
-  triangle or normal, or Shaded with any of Blender's matcaps (thumbnail selector)
-- Black outlines around each meshlet's perimeter plus a thinner triangle wireframe (on by
-  default), drawn in the fragment shader with widths in model units: they scale with the mesh,
-  not the screen, and are anti-aliased, fading out when thinner than a pixel
 - UV grid (`--uv-grid`, "UV grid" in the Rendering section): for models with texture coordinates,
   a grid over the UVs (`--uv-grid-cells N` per UV unit, with a faint checker) replaces the triangle
   wireframe while the meshlet outlines stay. UVs load from PLY (per-vertex `u`/`v`, `s`/`t` or
